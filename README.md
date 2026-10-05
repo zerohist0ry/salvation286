@@ -1,0 +1,9 @@
+# SALVATION - SAVE AS 80286
+
+    C:\>286 /BOOT /TIME:23:55
+    C:\>NC JOB.TXT
+    1 SOUL REMAINING.
+    C:\>COPY SOUL.DAT C:\HEAVEN
+    REM BY NIKOLAY SAVELIEV
+
+https://salvation286.net
