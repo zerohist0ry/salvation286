@@ -341,7 +341,8 @@ function present() {
   dctx.fillStyle = '#000';
   dctx.fillRect(0, 0, D.width, D.height);
   if (FX.off) return;
-  if (GFX.on) renderGFX(); else renderVGA();
+  if (GFX.on && !(typeof PAGE !== 'undefined' && PAGE.cur)) renderGFX(); else renderVGA();
+  if (typeof POWER !== 'undefined' && POWER.fx && POWER.drawFx(dctx)) return;
   dctx.drawImage(VGA, 0, 0, 640, 400, VIEW.ox, VIEW.oy, VIEW.w, VIEW.h);
 }
 // window -> cell
@@ -358,8 +359,12 @@ const AU = {
   muted: Q.get('mute') === '1',
 };
 
+// A browser lets a page make no sound until somebody has touched it. The context is made as soon as the page loads, in
+// case this browser already allows it; otherwise it waits, suspended, for the first key or click, and nothing is scheduled
+// on it until it is actually running (sounds queued on a stopped clock would all go off at once when it starts).
 AU.init = function () {
-  if (AU.ctx || AU.muted) { if (AU.ctx && AU.ctx.state === 'suspended') AU.ctx.resume(); return; }
+  if (AU.muted) return;
+  if (AU.ctx) { if (AU.ctx.state !== 'running') { try { const p = AU.ctx.resume(); if (p && p.catch) p.catch(() => {}); } catch (e) {} } return; }
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return;
   let ctx;
@@ -384,9 +389,16 @@ AU.init = function () {
   const w = AU.noiseW.getChannelData(0), b = AU.noiseB.getChannelData(0);
   let last = 0;
   for (let i = 0; i < len; i++) { const r = Math.random() * 2 - 1; w[i] = r; last = (last + 0.02 * r) / 1.02; b[i] = last * 3.5; }
-  AU.on = true;
-  AU.roomStart();
-  if (AU.pending) { const p = AU.pending; AU.pending = null; p(); }
+  const up = () => {
+    if (AU.on || ctx.state !== 'running') return;
+    AU.on = true;
+    AU.roomStart();
+    if (AU.pending) { const p = AU.pending; AU.pending = null; p(); }
+    if (AU.onUp) { const f = AU.onUp; AU.onUp = null; f(); }
+  };
+  try { ctx.addEventListener('statechange', up); } catch (e) { ctx.onstatechange = up; }
+  if (ctx.state === 'running') up();
+  else { try { const p = ctx.resume(); if (p && p.then) p.then(up, () => {}); } catch (e) {} }
 };
 AU.t = function () { return AU.ctx ? AU.ctx.currentTime : 0; };
 
@@ -439,9 +451,30 @@ AU.roomStart = function () {
   const tf = ctx.createBiquadFilter(); tf.type = 'bandpass'; tf.frequency.value = 2900; tf.Q.value = 6;
   const tg = ctx.createGain(); tg.gain.value = 0.0035; tb.connect(tf); tf.connect(tg); tg.connect(room); tb.start();
   AU.tubeG = tg;
-  // the hard disk spinning
+  // the machine itself, which is only there while it is switched on: the hard disk spinning, the fan in the supply
+  const mach = ctx.createGain(); mach.gain.value = 0; mach.connect(room);
+  AU.mach = mach;
   const hd = ctx.createOscillator(); hd.frequency.value = 90;
-  const hg = ctx.createGain(); hg.gain.value = 0.004; hd.connect(hg); hg.connect(room); hd.start();
+  const hg = ctx.createGain(); hg.gain.value = 0.004; hd.connect(hg); hg.connect(mach); hd.start();
+  const fs = ctx.createBufferSource(); fs.buffer = AU.noiseW; fs.loop = true;
+  const ff = ctx.createBiquadFilter(); ff.type = 'bandpass'; ff.frequency.value = 380; ff.Q.value = 0.8;
+  const fg = ctx.createGain(); fg.gain.value = 0.016; fs.connect(ff); ff.connect(fg); fg.connect(mach); fs.start();
+  const fb = ctx.createOscillator(); fb.frequency.value = 236;                                  // seven blades at 2000 rpm
+  const fbg = ctx.createGain(); fbg.gain.value = 0.0016; fb.connect(fbg); fbg.connect(mach); fb.start();
+  if (AU.machWanted) AU.machineOn(ctx.currentTime, 0.2);
+};
+// the fan winding up to speed and the disk's hum arriving with it
+AU.machineOn = function (t, secs = 1.6) {
+  AU.machWanted = true;
+  if (!AU.mach) return;
+  const g = AU.mach.gain; t = t || AU.t();
+  g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(1, t + secs);
+};
+AU.machineOff = function () {
+  AU.machWanted = false;
+  if (!AU.mach) return;
+  const t = AU.t(), g = AU.mach.gain;
+  g.cancelScheduledValues(t); g.setValueAtTime(0, t);
 };
 AU.roomOff = function (fast) {
   if (!AU.room) return;
@@ -642,15 +675,93 @@ AU.stone = function (level = 1) {
   auTone('sine', t + 0.001, 1900 + Math.random() * 1700, 0.03, 0.022 * v, null, out);
 };
 // the tube degaussing when the power comes back
-AU.degauss = function () {
+AU.degauss = function () { if (AU.on) AU.degaussAt(AU.t()); };
+AU.degaussAt = function (t) {
   if (!AU.on) return;
-  const t = AU.t();
   const o = AU.ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 60;
   const f = AU.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 900;
   const g = AU.ctx.createGain(); g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.32, t + 0.03);
   g.gain.exponentialRampToValueAtTime(0.0001, t + 1.4);
   o.connect(f); f.connect(g); g.connect(AU.master); o.start(t); o.stop(t + 1.5);
   auNoise(AU.noiseB, t, 0.5, 'lowpass', 200, 0.7, 0.35, 0.01);
+};
+
+// ------------------------------------------------ the machine coming on
+// the rocker (when a hand is on it), the supply thumping in, its fan winding up, the monitor on the switched outlet behind
+// degaussing, the tube crackling as it charges, the platters spinning up through their whine, the floppy drive asked if it
+// is there, and the heads of the hard disk knocking their way to track 0. o.switch: somebody's thumb; without it the power
+// has simply come back.
+AU.powerOn = function (o = {}) {
+  AU.machWanted = true;
+  if (!AU.on) return;
+  const t = AU.t() + 0.01;
+  if (o.switch) {
+    auNoise(AU.noiseW, t, 0.007, 'highpass', 2400, 0.7, 0.62, 0.0004);          // the snap
+    auNoise(AU.noiseW, t + 0.003, 0.035, 'bandpass', 1100, 1.3, 0.3, 0.001);     // the plastic of it
+    auTone('sine', t, 170, 0.08, 0.55, 75);                                       // the thump under the thumb
+    auNoise(AU.noiseB, t + 0.008, 0.14, 'lowpass', 240, 0.8, 0.55, 0.003);
+    auNoise(AU.noiseW, t + 0.05, 0.005, 'highpass', 3200, 0.7, 0.16, 0.0004);    // and it settles
+  }
+  const s = t + (o.switch ? 0.03 : 0);
+  auTone('sine', s + 0.01, 58, 0.3, 0.42, 42);                                    // inrush
+  auTone('sawtooth', s + 0.01, 120, 0.4, 0.05, null, null, 0.01);                 // the transformer, buzzing until it settles
+  AU.machineOn(s, 1.6);
+  AU.degaussAt(s + 0.12);
+  for (let i = 0; i < 18; i++) {                                                 // the tube charging: static on the glass
+    const c = s + 0.25 + Math.pow(Math.random(), 1.6) * 1.6;
+    auNoise(AU.noiseW, c, 0.0015 + Math.random() * 0.003, 'highpass', 3800 + Math.random() * 3000, 0.7, 0.05 + Math.random() * 0.12, 0.0003);
+  }
+  AU.spinUp(s + 0.2, 4.2);
+  after(2100, () => AU.floppy(0.75, 'read'));
+  after(4500, () => AU.recal());
+};
+// the hard disk spinning up: the motor's growl and its whine climbing to speed, and the air in the case with them
+AU.spinUp = function (t, secs = 4.2) {
+  if (!AU.on) return;
+  const ctx = AU.ctx;
+  const o1 = ctx.createOscillator(); o1.type = 'sawtooth';
+  o1.frequency.setValueAtTime(16, t); o1.frequency.exponentialRampToValueAtTime(180, t + secs);
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.6;
+  bp.frequency.setValueAtTime(140, t); bp.frequency.exponentialRampToValueAtTime(900, t + secs);
+  const g1 = ctx.createGain(); g1.gain.setValueAtTime(0, t); g1.gain.linearRampToValueAtTime(0.06, t + secs * 0.5);
+  g1.gain.linearRampToValueAtTime(0.035, t + secs); g1.gain.linearRampToValueAtTime(0, t + secs + 1.8);
+  o1.connect(bp); bp.connect(g1); g1.connect(AU.master); o1.start(t); o1.stop(t + secs + 2);
+  const o2 = ctx.createOscillator(); o2.type = 'sine';
+  o2.frequency.setValueAtTime(210, t); o2.frequency.exponentialRampToValueAtTime(1650, t + secs);
+  const g2 = ctx.createGain(); g2.gain.setValueAtTime(0, t); g2.gain.linearRampToValueAtTime(0.016, t + secs * 0.7);
+  g2.gain.linearRampToValueAtTime(0.008, t + secs); g2.gain.linearRampToValueAtTime(0, t + secs + 2.5);
+  o2.connect(g2); g2.connect(AU.master); o2.start(t); o2.stop(t + secs + 2.6);
+  const ns = ctx.createBufferSource(); ns.buffer = AU.noiseW; ns.loop = true;
+  const nf = ctx.createBiquadFilter(); nf.type = 'bandpass'; nf.Q.value = 0.9;
+  nf.frequency.setValueAtTime(300, t); nf.frequency.exponentialRampToValueAtTime(1400, t + secs);
+  const ng = ctx.createGain(); ng.gain.setValueAtTime(0, t); ng.gain.linearRampToValueAtTime(0.022, t + secs); ng.gain.linearRampToValueAtTime(0, t + secs + 1.5);
+  ns.connect(nf); nf.connect(ng); ng.connect(AU.master); ns.start(t); ns.stop(t + secs + 1.6);
+};
+// the stepper heads of an old MFM drive recalibrating: a run of steps that buzz, and the knock at the stop
+AU.recal = function () {
+  if (!AU.on) return;
+  let t = AU.t() + 0.01;
+  const burst = (n, rate) => { for (let s = 0; s < n; s++) { auNoise(AU.noiseW, t, 0.004, 'bandpass', 1300, 1.8, 0.16, 0.0005); auTone('square', t, 190, 0.005, 0.035); t += rate; } };
+  const knock = (lv) => { auNoise(AU.noiseB, t, 0.06, 'lowpass', 420, 0.9, 0.5 * lv, 0.002); auTone('sine', t, 130, 0.06, 0.32 * lv, 80); auNoise(AU.noiseW, t, 0.01, 'bandpass', 2200, 1.4, 0.12 * lv, 0.0006); t += 0.09; };
+  burst(16, 0.0042); knock(1); t += 0.22; burst(7, 0.005); knock(0.7); t += 0.12; burst(3, 0.006); knock(0.45);
+};
+// paper: the perforation giving way a hole at a time, and the sheet coming free
+AU.tear = function (level = 1) {
+  if (!AU.on) return;
+  const t = AU.t() + 0.005, n = 26, dur = 0.24;
+  for (let i = 0; i < n; i++) {
+    const c = t + (i / n) * dur + Math.random() * 0.006;
+    auNoise(AU.noiseW, c, 0.004 + Math.random() * 0.006, 'bandpass', 1400 + Math.random() * 2600, 1.2, (0.05 + Math.random() * 0.08) * level, 0.0005);
+  }
+  auNoise(AU.noiseW, t, dur + 0.05, 'bandpass', 2200, 0.8, 0.07 * level, 0.03);
+  auNoise(AU.noiseW, t + dur + 0.02, 0.18, 'highpass', 1800, 0.7, 0.05 * level, 0.02);
+};
+// a sheet turned over onto the next one
+AU.leaf = function (level = 1) {
+  if (!AU.on) return;
+  const t = AU.t() + 0.005;
+  auNoise(AU.noiseW, t, 0.16, 'bandpass', 2600, 0.7, 0.06 * level, 0.05);
+  auNoise(AU.noiseW, t + 0.07, 0.05, 'highpass', 3500, 0.7, 0.05 * level, 0.004);
 };
 AU.cut = function () {             // the power goes: everything stops at once
   if (!AU.on) return;
@@ -662,6 +773,7 @@ AU.cut = function () {             // the power goes: everything stops at once
   AU.master.gain.setValueAtTime(AU.master.gain.value, t);
   AU.master.gain.linearRampToValueAtTime(0, t + 0.01);
   AU.roomOff(true);
+  AU.machineOff();
 };
 AU.restore = function () {
   if (!AU.on) return;
@@ -992,6 +1104,7 @@ function fsReset() {
     fe('SING', 'TXT', 0, '09-26-92', '11:02p'), fe('BANNER', 'TXT', 0, '10-03-92', '12:15a'),
     fe('BRIDGE', 'TXT', 0, '10-02-92', '3:40a'), fe('HOMECOMG', 'TXT', 0, '06-01-92', '9:15p'),
     fe('NOTEBURN', 'TXT', 0, '09-29-92', '7:40p'), fe('WATCHNT', 'TXT', 0, '10-03-92', '1:12a'), fe('FUND', 'TXT', 0, '09-20-92', '8:05p'), fe('TWOWAYS', 'TXT', 0, '08-30-92', '2:20p'),
+    fe('PAMPHLET', 'BAT', 0, '10-03-92', '11:49p'),
   ];
   FS['C:\\TEMP'] = [fe('~WRL0004', 'TMP', 0, '10-03-92', '11:51p')];
   FS['C:\\UTIL'] = [
@@ -1032,7 +1145,7 @@ function fsReset() {
     ['C:\\CHURCH', 'BULLETIN.TXT'], ['C:\\CHURCH', 'PRAYER.TXT'], ['C:\\CHURCH', 'MINUTES.TXT'],
     ['C:\\CHURCH', 'REVIVAL.TXT'], ['C:\\CHURCH', 'LETTER.TXT'],
     ['C:\\CHURCH', 'FOURATTR.TXT'], ['C:\\CHURCH', 'ROMANRD.TXT'], ['C:\\CHURCH', 'RAPTURE.TXT'], ['C:\\CHURCH', 'SING.TXT'], ['C:\\CHURCH', 'BANNER.TXT'],
-    ['C:\\CHURCH', 'BRIDGE.TXT'], ['C:\\CHURCH', 'HOMECOMG.TXT'], ['C:\\CHURCH', 'NOTEBURN.TXT'], ['C:\\CHURCH', 'WATCHNT.TXT'], ['C:\\CHURCH', 'FUND.TXT'], ['C:\\CHURCH', 'TWOWAYS.TXT'],
+    ['C:\\CHURCH', 'BRIDGE.TXT'], ['C:\\CHURCH', 'HOMECOMG.TXT'], ['C:\\CHURCH', 'NOTEBURN.TXT'], ['C:\\CHURCH', 'WATCHNT.TXT'], ['C:\\CHURCH', 'FUND.TXT'], ['C:\\CHURCH', 'TWOWAYS.TXT'], ['C:\\CHURCH', 'PAMPHLET.BAT'],
     ['C:\\CNC', 'CNC.NFO'], ['C:\\CNC', 'FILE_ID.DIZ'], ['C:\\CNC', 'RULE.DOC']]) {
     const f = fsFind(path, nm); if (f && TEXTS[nm]) f.size = TEXTS[nm].replace(/\n/g, '\r\n').length + 2;
   }
@@ -1364,6 +1477,7 @@ function compose() {
   const nm = BASE && BASE.name;
   const allowed = (BASE === NC && !NC.running) || nm === 'view' || nm === 'whirl' || nm === 'surface' || LAYERS.some(l => l instanceof Dlg);
   MS.show = MS.vis && allowed && !(MS.by === 'ghost' && NOW - (G.lastMouseAt || 0) > 7000);
+  if (typeof PAGE !== 'undefined') PAGE.draw();
 }
 
 // ---------------------------------------------------------------- the world clock
@@ -2631,6 +2745,7 @@ async function RUN(line, src = 'ghost') {
     case 'ADVENT': SEEN.add('advent'); await ADVENT.run({ src }); return;
     case 'TERM': case 'TELIX': case 'QMODEM': case 'PROCOMM': SEEN.add('term'); await TERM.run({ src }); return;
     case 'PRINT': return cmdPrint(args, src);
+    case 'PAMPHLET': return runSmallBatch('C:\\CHURCH', 'PAMPHLET.BAT', src);
     case 'MSAV': await MSAV.run({ src }); return;
     case 'PROVIDNC': case 'PROVIDENCE': await PROV.show('ask', src); return;
     case 'SCORE': return cmdScore();
@@ -3369,6 +3484,7 @@ SURFACE.run = async function (o = {}) {
     while (pos < n && !stop) {
       const target = Math.min(n, Math.floor((NOW - t0) / dur * n));
       while (pos < target) { const i = order[pos]; cell[i] = bad[i] ? 2 : 1; if (bad[i]) { nbad++; } pos++; }
+      if (G.cut && G.cut.kind === 'surface' && pos / n >= G.cut.at) { const c = G.cut; G.cut = null; PAGE.show(c.name, c.ms); }
       if (rnd() < 0.3) AU.hdd(1, 0.05);
       await wait(33);
     }
@@ -3443,6 +3559,7 @@ DEFRAG.run = async function (o = {}) {
       }
       if (rnd() < 0.5) AU.hdd(1, 0.05);
       if (rnd() < 0.3) AU.beep(1400 + rnd() * 700, 0.008, 0.04);
+      if (G.cut && G.cut.kind === 'defrag' && writeHead / Math.max(1, totalUsed) >= G.cut.at) { const c = G.cut; G.cut = null; PAGE.show(c.name, c.ms); }
       await wait(42);
     }
     readAt = writeAt = -1; done = true;
@@ -3620,92 +3737,8 @@ CRASH.run = async function (o = {}) {
   if (o.reboot) G.warmBoot();
 };
 
-// ---------------------------------------------------------------- the pack's loader: a door, already open
+// ---------------------------------------------------------------- the pack's loader: a door, already open (HARROW.run is in 30_cncview.js)
 const HARROW = {};
-HARROW.run = async function (o = {}) {
-  const prev = BASE;
-  const doctrine = ['the soul is a file.', 'salvation is a copy operation.', '',
-    'your prior was set', 'before you were born.', '',
-    'the evidence will not', 'update it.', '',
-    'we call this grace.'];
-  let shown = 0, lamp = 0, phase = 'intro', bar = 0, done = false;
-  // first the loader, the way the packs came in: raster bars, three planes of stars, and a scroller that waves
-  const SCROLL = '    CNC .  THE LATTER-DAY PRIORS PRESENT SOUL.ZIP .  GREETS TO AUGUSTINE  CALVIN  BAYES  MOLINA  AND THE REMNANT .  NO GREETS TO PELAGIUS .  YOUR PRIOR WAS SET BEFORE YOU WERE BORN .  ';
-  const cols = [];
-  for (const ch of SCROLL) { const g = BIGF[ch] || BIGF[' ']; for (let i = 0; i < g[0].length; i++) { let bits = 0; for (let r = 0; r < 6; r++) if (g[r][i] === '#') bits |= 1 << r; cols.push(bits); } cols.push(0); }
-  const rr = lcg(1993), STARS3 = []; for (let i = 0; i < 70; i++) STARS3.push([rr() * 80, 2 + Math.floor(rr() * 44), 1 + Math.floor(rr() * 3)]);
-  const RBAR = [BLU, LBL, LCY, WHT, LCY, LBL, BLU], RAIN = [YEL, WHT, LMG, LRD, YEL, LGN, WHT, LMG];
-  let t0i = NOW;
-  const drawIntro = (t) => {
-    pclear(K0);
-    for (const [x0, y, sp] of STARS3) pset(Math.floor((((x0 - t / 1000 * sp * 10) % 80) + 80) % 80), y, sp === 3 ? WHT : sp === 2 ? LGR : DGR);
-    for (let b = 0; b < 3; b++) {
-      const cy = 24 + Math.sin(t / 650 + b * 2.1) * 15;
-      RBAR.forEach((c, i) => { const y = Math.round(cy - 3 + i); for (let x = 0; x < 80; x++) pset(x, y, c); });
-    }
-    const off = Math.floor(t / 1000 * 34) - 80;
-    for (let pass = 0; pass < 2; pass++) for (let x = 0; x < 80; x++) {
-      const ci = x + off; if (ci < 0) continue;
-      const bits = cols[ci % cols.length]; if (!bits) continue;
-      const yb = Math.round(21 + Math.sin((x + t / 30) / 11) * 5), c = RAIN[Math.floor((ci + t / 90) / 6) % RAIN.length];
-      for (let r = 0; r < 6; r++) if (bits & (1 << r)) { if (pass === 0) { pset(x + 1, yb + r + 1, K0); pset(x, yb + r + 1, K0); } else pset(x, yb + r, c); }
-    }
-  };
-  const view = {
-    name: 'harrow',
-    draw() {
-      if (phase === 'intro') { drawIntro(NOW - t0i); put(0, 24, padC('cNc  ·  SOUL.ZIP  ·  press a key', 80), K0, LGR); return; }
-      if (phase === 'flash') { cls(WHT, WHT); return; }
-      cls(LGR, K0);
-      center(1, 'C U L T   O F   T H E', LCY, K0);
-      bigText(Math.floor((W - bigWidth('NULL COW')) / 2), 3, 'NULL COW', WHT, K0);
-      center(7, '- the Latter-Day Priors -', DGR, K0);
-      const dx = 8, dy = 11, dw = 13, dh = 12;
-      box(dx, dy, dw, dh, 'd', BRN, K0, '', BRN, K0);
-      const lit = (lamp >> 2) % 9 !== 0;
-      for (let y = dy + 1; y < dy + dh - 1; y++) {
-        for (let x = dx + 1; x < dx + dw - 3; x++) put(x, y, '█', BRN, K0);
-        put(dx + dw - 3, y, lit ? '▐' : '█', lit ? YEL : BRN, K0);
-        put(dx + dw - 2, y, lit ? '█' : '░', lit ? YEL : DGR, K0);
-      }
-      put(dx + 3, dy + (dh >> 1), '°', K0, BRN);
-      center(dy + dh, 'the back door', BRN, K0, dx - 2, dw + 4);
-      const tx = 28;
-      for (let i = 0; i < shown; i++) put(tx, 9 + i, doctrine[i], i >= 6 ? YEL : LGR, K0);
-      if (phase === 'open') put(tx, 22, 'opening  [' + '#'.repeat(bar / 5 | 0) + '·'.repeat(20 - (bar / 5 | 0)) + ']', LCY, K0);
-      else if (phase === 'done') put(tx, 22, 'the door was already open.', WHT, K0);
-      put(0, 24, padC('cNc  ·  SOUL.ZIP  ·  press ESC', 80), K0, LGR);
-    },
-  };
-  BASE = view;
-  let skip = false;
-  const h = { modal: true, key(ev) { if (ev.k === 'Esc') done = true; else if (phase === 'intro') skip = true; return true; }, mouse(ev) { if (ev.type === 'down' && phase === 'intro') skip = true; return true; } };
-  pushH(h);
-  const tune = [];
-  try {
-    // the loader's tune, on the one voice the machine has: a figure in A minor, round and round
-    if (AU.on) {
-      const t = AU.t() + 0.05, step = 0.11, fig = [440, 659.25, 880, 659.25, 523.25, 659.25, 880, 1046.5];
-      for (let i = 0; i < 64; i++) tune.push(AU.note(t + i * step, fig[i % 8] * (Math.floor(i / 16) % 2 ? 0.8909 : 1), step * 0.8, 0.32));
-    }
-    const ghost = /^ghost/.test(o.src || ''), introMs = ghost ? 3800 : 9000;
-    t0i = NOW;
-    while (NOW - t0i < introMs && !skip && !done) await wait(50);
-    for (const n of tune) { try { n.stop(); } catch (e) {} }
-    phase = 'flash'; AU.beep(1760, 0.03, 0.4); await wait(70);
-    phase = 'read';
-    AU.drone(12, 0.5, 48);
-    for (let i = 0; i < doctrine.length && !done; i++) {
-      shown = i + 1; if (doctrine[i]) AU.key('k', 0.3);
-      const t0 = NOW; while (NOW - t0 < (doctrine[i] ? (/^ghost/.test(o.src || '') ? 540 : 620) : 240) * G.pace() && !done) { lamp++; await wait(55); }
-    }
-    { const t0 = NOW; while (NOW - t0 < (ghost ? 500 : 700) && !done) { lamp++; await wait(55); } }
-    phase = 'open';
-    for (bar = 0; bar <= 100 && !done; bar += 5) { if (rnd() < 0.4) AU.hdd(1, 0.05); lamp++; await wait(80); }
-    phase = 'done'; AU.beep(880, 0.12, 0.5);
-    const t0 = NOW; while (NOW - t0 < (o.hold || (ghost ? 1900 : 6000)) && !done) { lamp++; await wait(80); }
-  } finally { for (const n of tune) { try { n.stop(); } catch (e) {} } popH(h); BASE = prev; }
-};
 
 // ---------------------------------------------------------------- help: the system utilities, and what answered Job
 const HELP_TOPICS = [
@@ -4437,6 +4470,7 @@ G.cmd = async function (text, style = 'slow', o = {}) {
 
 const MIDNIGHT = 86400;
 const HYMN_BPM = 72, HYMN_CUT_BEAT = 19.6;                        // the power goes just after "me" begins
+const HYMN_LEVEL = 0.58;                                          // the last hymn sits under the room, not over it
 const HYMN_LEAD = HYMN_CUT_BEAT * 60 / HYMN_BPM;
 const GRACE = [[587.33, 1], [783.99, 2], [987.77, 0.5], [783.99, 0.5], [987.77, 2], [880, 1], [783.99, 2], [659.26, 1], [587.33, 2], [587.33, 1],
   [783.99, 2], [987.77, 0.5], [783.99, 0.5], [987.77, 2], [880, 1], [1174.66, 5]];
@@ -4479,6 +4513,7 @@ function END(why) {
     STATE.jobRunning = false; G.ownsRun = false; STATE.dark = false;
     VT.stop(true);
     DEMO.card = null; DEMO.caps = []; PROV.pop = null;
+    SPOOL.on = false; PAGE.cur = null; G.cut = null;
     STATE.lostChains = 1;                       // the save that was in progress
     CLOCKFACE.on = false; CLOCKFACE.midnight = false;
     palReset();
@@ -4514,7 +4549,8 @@ async function PREROLL() {
   fsReset();
   VSAFE.reset();
   SEEN.clear();                                   // SCORE counts tonight only
-  Object.assign(STATE, { restored: false, jobRunning: false, jobDone: false, aFlaky: true, inWhirl: false, dark: false, ctrlC: false, freehand: false });
+  Object.assign(STATE, { restored: false, jobRunning: false, jobDone: false, aFlaky: true, inWhirl: false, dark: false, ctrlC: false, freehand: false, printTSR: false });
+  SPOOL.reset(); PAGE.cur = null; G.cut = null;
   G.paceK = Q.get('fast') ? 1 / +Q.get('fast') : 1; G.backwards = false; G.ownsRun = false;
   T.echo = true; T.prompt = '$P$G'; T.cwd = 'C:\\'; T.drive = 'C';
   NC.L.path = 'C:\\'; NC.R.path = 'C:\\UZ\\JOB'; NC.act = 'R'; NC.L.sel = NC.R.sel = 0; NC.hidden = false; NC.panels = true; NC.cmd = '';
@@ -4534,9 +4570,16 @@ async function PREROLL() {
     SKIPPED_BOOT = true;
     return;
   }
-  if (!FIRST && AU.on) { AU.restore(); if (!warm) AU.degauss(); AU.roomOn(1.2); }
+  // the first time, the machine is off on the desk until somebody turns it on (or it does). after midnight the power
+  // simply comes back, and everything spins up again; a warm boot never lost it.
+  if (FIRST) await POWER.gate();
+  else {
+    if (AU.on) { AU.restore(); AU.roomOn(1.2); }
+    if (warm) AU.machineOn(AU.t(), 0.05);
+    else { AU.powerOn({}); POWER.crtOn(); }
+  }
   T.cursor = false;
-  await wait(warm ? 300 : 900);
+  await wait(warm ? 300 : FIRST ? 250 : 900);
   await POST(warm);
   // drive A first: the floppy is still in it
   AU.floppy(1.5, 'read');
@@ -4700,6 +4743,7 @@ const live = (q) => !q.on || q.on();
 // predestination is a showreel: everything on the disk, every night, cut together the way the night user flicks between things.
 const SCENES = [
   { n: 'browse', nom: 8.5, must: true, run: S_browse },        // the Commander, SOUL.DAT, a look at JOB.BAT
+  { n: 'pen', nom: 9.5, run: S_pen },                          // the whole rack sent to the printer, which carries on by itself
   { n: 'five', nom: 8.5, run: S_five },                        // the tract in drive A:
   { n: 'fro', nom: 14, run: S_fro },                         // QBasic: going to and fro in the earth
   { n: 'messengers', nom: 9.5, run: S_messengers },            // the prompt asks; the delete dialogs stack up; fire falls
@@ -4708,15 +4752,16 @@ const SCENES = [
   { n: 'boils', nom: 10, run: S_boils },                      // the surface, sole to crown
   { n: 'wife', nom: 9, run: S_wife },                        // curse God, and die; and nobody found
   { n: 'zzt', nom: 10, run: S_zzt },                         // the world the night user built
-  { n: 'pen', nom: 22, run: S_pen },                         // the printer: two pamphlets, back to back
-  { n: 'friends', nom: 34, run: S_friends },                 // THE ASH HEAP, the friends, LEVIATHAN
+  { n: 'pages', nom: 7.5, run: S_pages },                    // what has come out of the printer so far, leafed through
+  { n: 'friends', nom: 34, run: S_friends },                 // THE ASH HEAP, the friends, LEVIATHAN (a sheet while it dials)
   { n: 'msav', nom: 15, run: () => S_menu('V') },             // after the board, a scan: one file has changed since it was last checked
-  { n: 'defrag', nom: 11.5, run: () => S_menu('D') },           // the soul gathered into one piece
-  { n: 'heaven', nom: 8, run: S_heaven },                    // the hidden directory, and the house in it
+  { n: 'defrag', nom: 11.5, run: () => S_cut({ kind: 'defrag', name: 'WATCHNT.TXT', at: 0.38, ms: 2000 }, () => S_menu('D')) },   // the soul gathered into one piece
+  { n: 'heaven', nom: 10, run: S_heaven },                   // the hidden directory, the house in it, and the fund that paid for its corners
   { n: 'saved', nom: 5.5, run: S_saved },                      // the other tract
-  { n: 'harrow', nom: 15, run: () => S_menu('H') },           // the art pack
+  { n: 'harrow', nom: 22, must: true, run: S_harrow },       // the art pack: the loader, then every file of it, then the door
   { n: 'msd', nom: 7, run: () => S_menu('M') },              // the machine reports on itself
-  { n: 'advent', nom: 12, run: S_advent },                    // THE STRAIT GATE
+  { n: 'advent', nom: 14, run: S_advent },                    // the tract about the two ways, then THE STRAIT GATE
+  { n: 'banner', nom: 3.2, run: S_banner },                  // the last thing in the queue, still coming out
   { n: 'idle', nom: 3.5, run: S_stars, fill: true },
   { n: 'job', nom: 0, must: true, run: S_job },
 ];
@@ -4767,14 +4812,14 @@ async function FIVE() {
     const s = SCENES[i];
     if (!live(s)) continue;                                                  // not tonight
     const left = (MIDNIGHT - JOBN()) - clockSec();                       // time before the batch should start
-    const rest = SCENES.slice(i).filter(q => live(q) && !q.must && q.n !== 'job').reduce((a, q) => a + q.nom, 0);
+    const rest = SCENES.slice(i).filter(q => live(q) && q.n !== 'job' && !q.fill).reduce((a, q) => a + q.nom, 0);
     if (s.n !== 'job') {
       if (!s.must && left < s.nom * 0.6) continue;                            // no time for this one
       G.paceK = Math.max(0.55, Math.min(1, left / Math.max(1, rest + 4)));
       if (Q.get('fast')) G.paceK = Math.min(G.paceK, 1 / +Q.get('fast'));
     }
     SC(s.n);
-    await s.run();
+    try { await s.run(); } finally { G.cut = null; }
   }
 }
 
@@ -4804,7 +4849,7 @@ async function showAns(cmd, hold) {
   await wait(80);
   while (NC.running) await wait(100);
   G.ownsRun = false;
-  await G.pause(hold);
+  await wait(Math.max(hold * 0.85, hold * G.pace()));
   onto(T.buf, () => cls()); T.x = 0; T.y = 22;
   if (!NC.panels) G.key('^O');
   await G.pause(250);
@@ -4873,26 +4918,47 @@ async function S_wife() {
   await NC.findFile('ghost', { find: 'GOD.*' });
   await G.pause(300);
 }
-// the printer: two pamphlets queued, printed one after the other on the same paper
+// the printer: every pamphlet in the rack sent at once, by a batch file the night user keeps for it. PRINT goes on
+// printing in the background; the camera turns round to the printer for the first one, and later to the paper.
 const PEN_PAIRS = [['watchnt', 'bridge'], ['rapture', 'noteburn'], ['fund', 'sing'], ['twoways', 'rapture'], ['fourattr', 'homecomg'], ['sing', 'romanrd'], ['noteburn', 'watchnt'], ['rapture', 'fund'], ['twoways', 'sing'], ['bridge', 'fourattr'], ['homecomg', 'rapture'], ['romanrd', 'sing']];
 async function S_pen() {
   await G.tidy({ panels: true });
   G.key('^O'); await G.pause(300);
-  const [a, b] = PEN_PAIRS[(LOOP + VAR.pen) % PEN_PAIRS.length];
-  await G.cmd('print c:\\church\\' + a + '.txt c:\\church\\' + b + '.txt', 'fast', { beforeEnter: 120 });
+  await G.cmd('c:\\church\\pamphlet', 'fast', { beforeEnter: 120 });
   await G.pause(500);
+  if (SPOOL.busy()) await PRINTER.peek(Math.max(3200, 4200 * G.pace()));
   if (!NC.panels) G.key('^O');
   await G.pause(300);
+}
+// what has come out so far, torn off and gone through
+async function S_pages() {
+  await G.tidy({ panels: true });
+  await PAGE.flip(['RAPTURE.TXT', 'SING.TXT', 'HOMECOMG.TXT', 'NOTEBURN.TXT'], Math.max(1250, 1750 * G.pace()));
+  await G.pause(250);
+}
+// the last thing in the queue: a banner, printed sideways down the paper, held up the right way and read across
+async function S_banner() {
+  if (!PAGE.ready('BANNER.TXT')) return;
+  await G.tidy({ panels: true });
+  await PAGE.banner(3600);
+  await G.pause(200);
+}
+// a scene with a sheet of paper waiting in it: the program it runs looks up when it gets that far
+async function S_cut(cut, run) {
+  G.cut = cut;
+  try { await run(); } finally { G.cut = null; }
 }
 // the friends call the board; the night user plays the door game on the way out
 async function S_friends() {
   await G.tidy({ panels: true });
   if (!G.inNC()) return;
+  G.cut = { kind: 'dial', name: 'BRIDGE.TXT', at: 700, ms: 2200 };
   await G.cmd('term', 'fast', { want: { panels: true }, beforeEnter: 120 });
   await G.pause(600);
 }
 async function S_advent() {
   await G.tidy({ panels: true });
+  if (await PAGE.show('TWOWAYS.TXT', 2000)) await G.pause(250);
   await G.cmd('advent', 'fast', { beforeEnter: 100 });
   await G.pause(500);
 }
@@ -4926,6 +4992,23 @@ async function S_menu(letter) {
   while (NC.running) await wait(100);
   G.ownsRun = false;
   await G.pause(700);
+}
+// the art pack: into its directory and straight to the loader, which plays the whole pack through on the beat
+async function S_harrow() {
+  await G.tidy({ panels: true });
+  if (!G.inNC()) return;
+  const L = NC.L;
+  if (L.path !== 'C:\\' || !(await G.walkTo(L, 'CNC', 170))) return S_menu('H');
+  await G.pause(260); G.key('Enter'); await G.pause(650);
+  if (L.path !== 'C:\\CNC') return S_menu('H');
+  if (await G.walkTo(L, 'HARROW.EXE', 200)) {
+    await G.pause(320);
+    G.ownsRun = true; G.key('Enter');
+    await wait(300);
+    while (NC.running) await wait(100);
+    G.ownsRun = false;
+    await G.pause(300);
+  }
 }
 // the board the night user made: walk the ☺ up to the Oracle and read what it says
 async function S_zzt() {
@@ -4995,12 +5078,17 @@ async function S_heaven() {
   if (!(await G.walkTo(NC.L, 'HEAVEN', 200))) return;
   await G.pause(500);
   G.key('Enter'); await G.pause(900);                                      // C:\HEAVEN
-  if (await G.walkTo(NC.L, 'HOUSE', 220)) { await G.pause(400); G.key('Enter'); await G.pause(2000); }   // and the house, whole
+  if (await G.walkTo(NC.L, 'HOUSE', 220)) {                                   // and the house, whole
+    await G.pause(400); G.key('Enter'); await G.pause(1500);
+    await PAGE.show('FUND.TXT', 2000);                                         // "The house has been moved to C:\HEAVEN, as it stood."
+    await G.pause(300);
+  }
   if (NC.act !== 'R') { G.key('Tab'); await G.pause(300); }
 }
 async function S_boils() {
   await G.tidy({ panels: true });
   G.key('^O'); await G.pause(400);
+  G.cut = { kind: 'surface', name: 'ROMANRD.TXT', at: 0.3, ms: 2000 };
   await G.cmd('surface', 'fast', { beforeEnter: 90 });
   await G.pause(600);
 }
@@ -5057,7 +5145,7 @@ const JOBNOM = (U) => {
   if (U.startsWith('VSAFE')) return [3.2, 0];
   if (U.startsWith('CTTY CON')) return [3.5, 0];
   if (U === 'CTTY NUL') return [3.6, 0];
-  if (U === 'WHIRL') return [WHIRL_TOUR.reduce((a, [, h]) => a + h / 1000, 0) + 9.5, WHIRL_TOUR.reduce((a, [, h]) => a + h / 1000, 0)];
+  if (U === 'WHIRL') { const holds = WHIRL_TOUR.reduce((a, [, h]) => a + h / 1000, 0); return [holds + 4.2 + WHIRL_TOUR.length * 0.9, holds]; }
   if (U === 'UNDELETE') return [pre ? 6.2 : 12, 0];
   if (U === 'RIDE') return pre ? [RIDE_FRAME + 10, RIDE_FRAME + 10] : [17, 0];   // predestination: the ride is held, and takes up the slack
   if (U.startsWith('REM  OUT OF')) return [0.8, 0];
@@ -5189,7 +5277,7 @@ async function finalSave(a, b) {
       const d = beats * spb, end = t + d;
       if (end > now + 0.05) {
         const st = Math.max(t, now) - now, dur = end - Math.max(t, now);
-        AU.hymnNodes.push(AU.note(AU.t() + st + 0.02, f, dur * 0.93));
+        AU.hymnNodes.push(AU.note(AU.t() + st + 0.02, f, dur * 0.93, HYMN_LEVEL));
       }
       t = end;
     }
@@ -5202,9 +5290,11 @@ async function finalSave(a, b) {
   try { await saveAs(a, b, { final: true, until: MIDNIGHT, ghost: true }); }
   finally { if (tk) cancel(tk); sags.forEach(cancel); }
 }
-// the whirlwind, as the batch leaves it to whoever is at the keys: past the system's page to the world's, and the world
-// demonstrated four times. the demonstrations keep their own time, whatever the pace.
-const WHIRL_TOUR = [['FOUNDATN', 2600], ['SEA', 3300], ['ORION', 3000], ['LIGHTNIN', 3000]];
+// the whirlwind, as the batch leaves it to whoever is at the keys: past the system's page to the world's, and down the
+// world's list in order, every demonstration opened, and the raven, which has only its page. the demonstrations keep
+// their own time, whatever the pace.
+const WHIRL_TOUR = [['FOUNDATN', 2300], ['MORNSTAR', 2400], ['SEA', 2500], ['DAYSPRNG', 2500], ['SNOW', 1900], ['PLEIADES', 2500], ['ORION', 2500], ['LIGHTNIN', 2900], ['RAVEN', 2100]];
+const WHIRL_STEP = [300, 320];                    // the pause before a topic is opened, and after it is closed
 async function ghostWhirl(st, press, act) {
   await G.pause(1500);
   if (G.youBusy(2500)) await G.turn(2500);
@@ -5214,14 +5304,14 @@ async function ghostWhirl(st, press, act) {
     const i = HELP_TOPICS[st.page].findIndex(x => x[0] === name);
     if (i < 0) continue;
     for (let g = 0; g < 12 && st.sel !== i; g++) { if (G.youBusy(2500)) await G.turn(2500); act(st.sel < i ? '↓' : '↑'); AU.key('k'); await G.pause(180 + rnd() * 90); }
-    await G.pause(380);
+    await G.pause(WHIRL_STEP[0]);
     if (G.youBusy(2500)) await G.turn(2500);
     if (st.topic) act('Esc');
     AU.key('enter'); await press('Ok');
     await wait(hold);
     if (G.youBusy(2500)) await G.turn(2500);
     AU.key('k'); act('Esc');
-    await G.pause(420);
+    await G.pause(WHIRL_STEP[1]);
   }
   await G.pause(500);
   AU.key('k'); act('Esc');
@@ -5641,6 +5731,7 @@ TERM.run = function (o = {}) {
       const result = e.kind === 'busy' ? 'busy' : e.kind === 'voice' ? 'voice' : 'connect';
       const secs = AU.modem(e.num, { short: AUTO, result });
       st.dialing = { e, t0: NOW, secs: result === 'busy' ? (AUTO ? 1.9 : 2.6) : secs };
+      if (AUTO && G.cut && G.cut.kind === 'dial' && result === 'connect') { const c = G.cut; G.cut = null; after(c.at, () => { if (st.dialing) PAGE.show(c.name, c.ms); }); }
       await wait((result === 'busy' ? (AUTO ? 1.9 : 2.6) : secs) * 1000);
       st.dialing = null;
       if (result === 'busy') { await modemSay('BUSY'); await wait(900); return 'busy'; }
@@ -5687,7 +5778,7 @@ TERM.run = function (o = {}) {
       const plan = AUTO ? (o.plan || ['M', 'D', 'G']).slice() : null;
       for (;;) {
         await menu();
-        const c = await keyIn('MFDBPGW', plan ? plan.shift() || 'G' : null, 900);
+        const c = await keyIn('MFDBPGW', plan ? plan.shift() || 'G' : null, AUTO ? 700 : 900);
         tw(c, WHT, K0); nl();
         if (c === 'M') await messages();
         else if (c === 'F') await files();
@@ -5737,7 +5828,7 @@ TERM.run = function (o = {}) {
         const last = i === FRIENDS.length - 1;
         await send(last ? ' End of messages.  [R]eply, [Q]uit? ' : ' [N]ext, [R]eply, [Q]uit? ', WHT);
         const g = AUTO ? (i + 1 < upto ? 'N' : 'Q') : null;
-        const c = await keyIn(last ? 'RQ\r' : 'NRQ\r', g, 1150);
+        const c = await keyIn(last ? 'RQ\r' : 'NRQ\r', g, AUTO ? 980 : 1150);
         tw(c === '\r' ? '' : c, WHT, K0); nl();
         if (c === 'R') { await reply(m); if (last) break; continue; }
         if (c === 'Q' || (last && c === '\r')) break;
@@ -5838,7 +5929,7 @@ TERM.run = function (o = {}) {
       await sendc([[' [1] ', YEL], ['LEVIATHAN   ', WHT], ['canst thou draw him out with an hook?\n', LGR]]);
       await sendc([[' [2] ', YEL], ['BEHEMOTH    ', WHT], ['he eateth grass as an ox  (closed)\n', DGR]]);
       await send(' Which door (Enter to quit)? ', WHT);
-      const c = await keyIn('12\r', AUTO ? '1' : null, 1500);
+      const c = await keyIn('12\r', AUTO ? '1' : null, AUTO ? 1100 : 1500);
       tw(c === '\r' ? '' : c, WHT, K0); nl();
       if (c === '2') { await sendl(' The door is closed.  Behold now behemoth, which I made with thee.', LGR); await wait(500); return; }
       if (c !== '1') return;
@@ -5850,7 +5941,7 @@ TERM.run = function (o = {}) {
       });
       st.cy = 22; st.cx = 0;
       await send(' Canst thou draw out leviathan with an hook (Y/N)? ', WHT);
-      const a = await keyIn('YN', AUTO ? 'N' : null, 1300);
+      const a = await keyIn('YN', AUTO ? 'N' : null, AUTO ? 1050 : 1300);
       tw(a, WHT, K0); nl();
       if (a === 'Y') { await sendl(' You let down a cord.  Lay thine hand upon him, remember the battle,', LGR); await sendl(' do no more.   GAME OVER', LRD); }
       else { await sendl(' Correct.  None is so fierce that dare stir him up.   YOU WIN', LGN); }
@@ -6225,57 +6316,59 @@ function paperRows(text) {
   return rows;
 }
 
+// the printer and the paper coming out of it, as one screen. st: the paper so far (done rows, the row on the platen and how
+// much of it is printed, which way the head is going, how far the paper has been fed past the last row)
+const PRN_PX = 10, PRN_VIS = 17;                  // printable columns start; rows of paper visible above the head
+function drawPrinterView(st, docs) {
+  cls(DGR, K0);
+  // the paper, from the top of the screen down into the printer
+  const top = st.done.length + (st.cur ? 1 : 0);
+  for (let y = 0; y <= PRN_VIS; y++) {
+    const ri = top - 1 - (PRN_VIS - y) + st.feed;          // the row of paper at screen row y
+    fill(6, y, 68, 1, ' ', DGR, WHT);
+    // tractor holes and perforations
+    const hole = ((ri + 1000) % 2) === 0;
+    put(6, y, hole ? '○' : ' ', LGR, WHT); put(73, y, hole ? '○' : ' ', LGR, WHT);
+    put(8, y, ':', LGR, WHT); put(71, y, ':', LGR, WHT);
+    if (ri >= 0 && ri % 33 === 32) for (let x = 9; x < 71; x += 2) put(x, y, '-', LGR, WHT);
+    let row = null, n = 60;
+    if (ri >= 0 && ri < st.done.length) row = st.done[ri];
+    else if (st.cur && ri === st.done.length) { row = st.cur; n = st.curN; }
+    if (!row) continue;
+    for (let i = 0; i < row.cells.length; i++) {
+      const printed = row === st.cur ? (st.dir > 0 ? i < n : i >= row.cells.length - n) : true;
+      if (!printed) continue;
+      const [c, fg] = row.cells[i];
+      if (c !== ' ') put(PRN_PX + i, y, c, row.big ? DGR : fg, WHT);
+    }
+  }
+  // the printer: a beige case, the platen, the head on its rail
+  fill(2, 18, 76, 7, ' ', DGR, LGR);
+  put(2, 18, '▄'.repeat(76), LGR, K0);
+  put(4, 19, '▀'.repeat(72), K0, LGR);
+  fill(6, 19, 68, 1, '▀', WHT, K0);                    // the paper going in
+  const hx = PRN_PX + Math.max(0, Math.min(59, Math.round(st.headX)));
+  put(hx - 1, 18, '▐█▌', K0, DGR); put(hx, 17, '▄', DGR, WHT);
+  put(5, 21, 'L E C T E R N    L X - 9', DGR, LGR);
+  put(5, 22, 'nine pin  ·  draft  ·  tractor', DGR, LGR);
+  put(50, 21, 'ON LINE', DGR, LGR); put(58, 21, '•', (Math.floor(NOW / 500) % 2 || !st.cur) ? LGN : GRN, LGR);
+  put(50, 22, 'POWER', DGR, LGR); put(58, 22, '•', LGN, LGR);
+  put(62, 21, '[FORM FEED]', DGR, LGR); put(62, 22, '[LINE FEED]', DGR, LGR);
+  fill(0, 24, 80, 1, ' ', DGR, K0);
+  const D = docs[Math.min(st.doc, docs.length - 1)];
+  if (D) put(1, 24, 'PRINT  ' + (D.full || D.name) + (docs.length > 1 ? '    ' + (Math.min(st.doc, docs.length - 1) + 1) + ' of ' + docs.length + ' in queue' : ''), DGR, K0);
+  put(66, 24, 'Esc = back', DGR, K0);
+}
+
 PRINTER.run = async function (o = {}) {
   const prev = BASE;
   // one document, or a queue of them (PRINT takes several names); they come out one after another on the same paper
   const docs = o.docs || [{ dir: o.dir, name: o.name || 'BULLETIN.TXT', full: o.full, text: o.text }];
   const st = { done: [], cur: null, curN: 0, dir: 1, headX: 0, stop: false, feed: 0, t0: NOW, doc: 0 };
-  const PX = 10, VIS = 17;                     // printable columns start; rows of paper visible above the head
+  const PX = PRN_PX;
   const P = () => (o.src === 'you' ? 1 : G.pace());
   PRINTER.on = true;
-  const view = {
-    name: 'printer',
-    draw() {
-      cls(DGR, K0);
-      // the paper, from the top of the screen down into the printer
-      const top = st.done.length + (st.cur ? 1 : 0);
-      for (let y = 0; y <= VIS; y++) {
-        const ri = top - 1 - (VIS - y) + st.feed;          // the row of paper at screen row y
-        fill(6, y, 68, 1, ' ', DGR, WHT);
-        // tractor holes and perforations
-        const hole = ((ri + 1000) % 2) === 0;
-        put(6, y, hole ? '○' : ' ', LGR, WHT); put(73, y, hole ? '○' : ' ', LGR, WHT);
-        put(8, y, ':', LGR, WHT); put(71, y, ':', LGR, WHT);
-        if (ri >= 0 && ri % 33 === 32) for (let x = 9; x < 71; x += 2) put(x, y, '-', LGR, WHT);
-        let row = null, n = 60;
-        if (ri >= 0 && ri < st.done.length) row = st.done[ri];
-        else if (st.cur && ri === st.done.length) { row = st.cur; n = st.curN; }
-        if (!row) continue;
-        for (let i = 0; i < row.cells.length; i++) {
-          const printed = row === st.cur ? (st.dir > 0 ? i < n : i >= row.cells.length - n) : true;
-          if (!printed) continue;
-          const [c, fg] = row.cells[i];
-          if (c !== ' ') put(PX + i, y, c, row.big ? DGR : fg, WHT);
-        }
-      }
-      // the printer: a beige case, the platen, the head on its rail
-      fill(2, 18, 76, 7, ' ', DGR, LGR);
-      put(2, 18, '▄'.repeat(76), LGR, K0);
-      put(4, 19, '▀'.repeat(72), K0, LGR);
-      fill(6, 19, 68, 1, '▀', WHT, K0);                    // the paper going in
-      const hx = PX + Math.max(0, Math.min(59, Math.round(st.headX)));
-      put(hx - 1, 18, '▐█▌', K0, DGR); put(hx, 17, '▄', DGR, WHT);
-      put(5, 21, 'L E C T E R N    L X - 9', DGR, LGR);
-      put(5, 22, 'nine pin  ·  draft  ·  tractor', DGR, LGR);
-      put(50, 21, 'ON LINE', DGR, LGR); put(58, 21, '•', (Math.floor(NOW / 500) % 2 || !st.cur) ? LGN : GRN, LGR);
-      put(50, 22, 'POWER', DGR, LGR); put(58, 22, '•', LGN, LGR);
-      put(62, 21, '[FORM FEED]', DGR, LGR); put(62, 22, '[LINE FEED]', DGR, LGR);
-      fill(0, 24, 80, 1, ' ', DGR, K0);
-      const D = docs[Math.min(st.doc, docs.length - 1)];
-      put(1, 24, 'PRINT  ' + (D.full || D.name) + (docs.length > 1 ? '    ' + (st.doc + 1) + ' of ' + docs.length + ' in queue' : ''), DGR, K0);
-      put(66, 24, 'Esc = back', DGR, K0);
-    },
-  };
+  const view = { name: 'printer', draw() { drawPrinterView(st, docs); } };
   BASE = view;
   const h = { modal: true, key(ev) { if (ev.k === 'Esc' && ev.src === 'you') st.stop = true; return true; }, mouse() { return true; } };
   pushH(h);
@@ -6323,12 +6416,16 @@ PRINTER.run = async function (o = {}) {
 
 async function cmdPrint(args, src) {
   if (!STATE.printTSR) {
-    T.write('Name of list device [PRN]: ');
-    await G.answerLine('', { kind: 'print', wait: 900, style: 'fast' });
+    if (!/\/D:\S+/i.test(args)) {                       // /D:PRN answers the question before it is asked
+      T.write('Name of list device [PRN]: ');
+      await G.answerLine('', { kind: 'print', wait: 900, style: 'fast' });
+    }
     STATE.printTSR = true;
     out('Resident part of PRINT installed');
     out('');
   }
+  // the demonstration leaves PRINT doing what PRINT is for: printing in the background while the night goes on
+  const bg = MODE === 'pre' && /^ghost/.test(src || '');
   const specs = args.replace(/\/\w+(:\S+)?/g, '').trim().split(/\s+/).filter(Boolean);
   if (!specs.length) { out('PRINT queue is empty'); return; }
   const docs = [];
@@ -6336,10 +6433,11 @@ async function cmdPrint(args, src) {
     const full = resolve(spec), { dir, name } = splitFile(full);
     const f = fsFind(dir, name);
     if (!f || f.dir) { out('File not found - ' + full); continue; }
-    out('    ' + full + (docs.length ? ' is in queue' : ' is currently being printed'));
+    out('    ' + full + (docs.length || (bg && SPOOL.busy()) ? ' is in queue' : ' is currently being printed'));
     docs.push({ dir, name, full });
   }
   if (!docs.length) return;
+  if (bg) { SPOOL.queue(docs); if (typeof SEEN !== 'undefined') SEEN.add('print'); return; }
   await wait(500 * G.pace());
   if (typeof SEEN !== 'undefined') SEEN.add('print');
   const budget = STATE.printMs || (/^ghost/.test(src) ? 9000 + 8000 * (docs.length - 1) : 0);
@@ -8292,6 +8390,1870 @@ async function cmdTithe(args, src) {
   await TITHE.run({ src, file });
 }
 
+// ---- 26_pages.js
+// The rack in the vestibule. PRINT stays resident and prints while you do other things; in the demonstration the night
+// user sends every pamphlet to the printer first thing, and the queue runs on behind everything else whether anyone is
+// watching or not. Now and then the camera turns round to the paper: a sheet torn off, held up, put down.
+
+TEXTS['PAMPHLET.BAT'] = `@ECHO OFF
+REM  the rack in the vestibule, one of each, in the order they go out
+PRINT /D:PRN /Q:11 C:\\CHURCH\\FOURATTR.TXT C:\\CHURCH\\ROMANRD.TXT C:\\CHURCH\\RAPTURE.TXT C:\\CHURCH\\SING.TXT
+PRINT C:\\CHURCH\\HOMECOMG.TXT C:\\CHURCH\\NOTEBURN.TXT C:\\CHURCH\\BRIDGE.TXT C:\\CHURCH\\WATCHNT.TXT
+PRINT C:\\CHURCH\\FUND.TXT C:\\CHURCH\\TWOWAYS.TXT C:\\CHURCH\\BANNER.TXT`;
+
+// a batch file with nothing in it but commands (JOB.BAT, with its labels and its choices, has an interpreter of its own)
+async function runSmallBatch(dir, name, src) {
+  if (!fsFind(dir, name)) { AU.hdd(2, 0.15); out('Bad command or file name'); return; }
+  let echo = true;
+  for (const raw of (TEXTS[name] || '').split('\n')) {
+    let line = raw.trim();
+    if (!line) continue;
+    const at = line.startsWith('@'); if (at) line = line.slice(1);
+    const U = line.toUpperCase();
+    if (U === 'ECHO OFF') { echo = false; continue; }
+    if (U === 'ECHO ON') { echo = true; continue; }
+    if (U.startsWith('REM')) continue;
+    if (echo && !at) { T.nl(); T.write(T.promptStr() + line); T.nl(); }
+    await RUN(line, src);
+  }
+}
+
+// ---------------------------------------------------------------- the queue, printing on its own
+const SPOOL = { st: null, docs: [], on: false, peekLoud: 0 };
+SPOOL.reset = function () { SPOOL.st = null; SPOOL.docs = []; SPOOL.on = false; SPOOL.peekLoud = 0; };
+SPOOL.busy = () => !!(SPOOL.st && SPOOL.st.phase !== 'idle');
+SPOOL.queue = function (docs) {
+  for (const D of docs) {
+    const f = D.dir ? fsFind(D.dir, D.name) : null;
+    SPOOL.docs.push(Object.assign({}, D, { rows: paperRows(D.text || TEXTS[D.name] || binaryText(D.name, f ? f.size : 2048)), start: -1, end: -1 }));
+  }
+  if (!SPOOL.st || SPOOL.st.phase === 'idle') {
+    const old = SPOOL.st;
+    SPOOL.st = old || { done: [], cur: null, curN: 0, dir: 1, headX: 0, feed: 0, doc: 0, i: 0, phase: 'next', tl: 0, step: 0 };
+    SPOOL.st.phase = 'next'; SPOOL.st.tl = 0;
+  }
+  SPOOL.on = true;
+};
+// how loud the printer is: in the room it is a long way off; when we turn round to it, it is there
+SPOOL.loud = () => Math.max(SPOOL.peekLoud, PAGE.cur ? 0.4 : 0);
+SPOOL.tick = function (dt) {
+  const st = SPOOL.st;
+  if (!SPOOL.on || !st || FX.off) return;
+  let left = dt;
+  for (let guard = 0; guard < 400 && left > 0; guard++) {
+    if (st.tl > 0) {
+      const used = Math.min(st.tl, left);
+      st.tl -= used; left -= used;
+      if (st.phase === 'print') {
+        const r = st.cur, n = r.cells.length, k = 1 - st.tl / st.step;
+        st.curN = Math.ceil(n * k); st.headX = st.dir > 0 ? n * k : n - n * k;
+      }
+      if (st.tl > 0) break;
+      // the step just ended
+      if (st.phase === 'print') {
+        st.curN = st.cur.cells.length; st.done.push(st.cur); st.cur = null; st.dir = -st.dir;
+        if (SPOOL.loud()) AU.printFeed(1);
+        st.phase = 'gap'; st.tl = 45; st.step = 45; continue;
+      }
+      if (st.phase === 'tof') { st.done.push({ cells: [], text: '' }); st.phase = st.done.length % 33 ? 'tof' : 'tofwait'; st.tl = st.phase === 'tof' ? 16 : 260; st.step = st.tl; continue; }
+      if (st.phase === 'feed') { st.feed++; st.ff = (st.ff || 0) + 1; if (st.ff < 6) { st.tl = 55; st.step = 55; continue; } st.phase = 'idle'; return; }
+      st.phase = 'row';
+    }
+    if (st.phase === 'idle') return;
+    if (st.phase === 'next') {
+      if (st.doc >= SPOOL.docs.length) { st.phase = 'feed'; st.ff = 0; st.tl = 55; st.step = 55; continue; }
+      st.i = 0;
+      if (st.done.length % 33 !== 0 && st.done.length > 0) { st.phase = 'tof'; st.tl = 16; st.step = 16; continue; }
+      st.phase = 'row';
+    }
+    if (st.phase === 'tofwait' || st.phase === 'gap' || st.phase === 'blank') st.phase = 'row';
+    if (st.phase === 'row') {
+      const D = SPOOL.docs[st.doc];
+      if (st.i === 0 && D.start < 0) D.start = st.done.length;
+      if (st.i >= D.rows.length) { D.end = st.done.length; st.doc++; st.phase = 'next'; continue; }
+      const r = D.rows[st.i++];
+      const ink = r.cells.filter(c => c[0] !== ' ').length;
+      if (!ink) { st.done.push(r); if (SPOOL.loud()) AU.printFeed(1); st.phase = 'blank'; st.tl = 70; st.step = 70; continue; }
+      const secs = r.big ? 0.22 : 0.09 + r.cells.length / 230;
+      st.cur = r; st.curN = 0; st.phase = 'print'; st.tl = secs * 1000; st.step = st.tl;
+      const lv = SPOOL.loud();
+      if (lv) AU.printLine(r.cells.map(c => c[0]).join(''), secs, (r.big ? 1.2 : 1) * lv);
+    }
+  }
+};
+ANIM.add((dt) => SPOOL.tick(dt));
+
+// turning round to the printer for a moment
+PRINTER.peek = async function (ms) {
+  if (!SPOOL.st) return;
+  const prev = BASE;
+  BASE = { name: 'printer', draw() { drawPrinterView(SPOOL.st, SPOOL.docs); } };
+  SPOOL.peekLoud = 1;
+  let quit = false;
+  const h = { modal: true, key(ev) { if (ev.src === 'you') quit = true; return true; }, mouse(ev) { if (ev.type === 'down' && ev.src === 'you') quit = true; return true; } };
+  pushH(h);
+  try { const t0 = NOW; while (NOW - t0 < ms && !quit) await wait(40); }
+  finally { popH(h); BASE = prev; SPOOL.peekLoud = 0; }
+};
+
+// ---------------------------------------------------------------- a sheet, held up
+// drawn over everything else, the screen and whatever is running on it, which carries on underneath
+const PAGE = { cur: null };
+PAGE.doc = (name) => SPOOL.docs.findIndex(D => D.name === name);
+PAGE.ready = (name) => { const d = PAGE.doc(name); return d >= 0 && SPOOL.docs[d].start >= 0; };
+// show a printed pamphlet for ms; o.leaf: it is turned over onto the one before; o.keep: leave it up for the next one
+PAGE.show = function (name, ms = 2000, o = {}) {
+  const d = PAGE.doc(name);
+  if (d < 0 || SPOOL.docs[d].start < 0 || FX.off) return Promise.resolve(false);
+  return new Promise(res => {
+    const prev = PAGE.cur;
+    const cur = { d, t0: NOW, ms, res, prev: prev && o.leaf ? prev : null, leaf: !!o.leaf, out: 0 };
+    PAGE.cur = cur;
+    if (prev && prev !== cur) prev.res(true);
+    if (o.leaf) AU.leaf(1); else AU.tear(1);
+    after(ms, () => {
+      if (PAGE.cur !== cur) return;
+      if (o.keep) { res(true); return; }
+      cur.out = NOW;                                          // put down: it drops out of the bottom of the picture
+      after(150, () => { if (PAGE.cur === cur) { PAGE.cur = null; AU.leaf(0.5); } res(true); });
+    });
+  });
+};
+PAGE.hide = function () { const c = PAGE.cur; if (!c) return; PAGE.cur = null; c.res(true); };
+// several, one after another, each laid on the last
+PAGE.flip = async function (names, each = 1700) {
+  const have = names.filter(PAGE.ready);
+  for (let i = 0; i < have.length; i++) await PAGE.show(have[i], each, { leaf: i > 0, keep: i < have.length - 1 });
+};
+// a key from whoever is at the machine puts the paper down at once
+PAGE.hideOnYou = function () { if (PAGE.cur && KB.lastYou > PAGE.cur.t0) PAGE.hide(); };
+ANIM.add(() => PAGE.hideOnYou());
+
+function drawPageAt(c, oy) {
+  const D = SPOOL.docs[c.d], st = SPOOL.st;
+  const last = D.end >= 0 ? D.end : st.done.length;            // a sheet still coming out is as far along as it has got
+  for (let y = Math.max(0, oy); y < 25; y++) {
+    const r = y - oy;
+    fill(0, y, 80, 1, ' ', DGR, K0);
+    if (r === 0) { put(6, y, '▄'.repeat(68), WHT, K0); continue; }   // the torn edge
+    const ri = D.start + r - 1;
+    fill(6, y, 68, 1, ' ', DGR, WHT);
+    const hole = ((ri + 1000) % 2) === 0;
+    put(6, y, hole ? '○' : ' ', LGR, WHT); put(73, y, hole ? '○' : ' ', LGR, WHT);
+    put(8, y, ':', LGR, WHT); put(71, y, ':', LGR, WHT);
+    if (ri % 33 === 32) for (let x = 9; x < 71; x += 2) put(x, y, '-', LGR, WHT);
+    if (ri >= last) continue;
+    const row = st.done[ri];
+    if (!row) continue;
+    for (let i = 0; i < row.cells.length; i++) { const [ch, fg] = row.cells[i]; if (ch !== ' ') put(PRN_PX + i, y, ch, row.big ? DGR : fg, WHT); }
+  }
+}
+PAGE.draw = function () {
+  const c = PAGE.cur;
+  if (!c) return;
+  const tin = Math.min(1, (NOW - c.t0) / 170), up = 1 - Math.pow(1 - tin, 3);
+  let oy = Math.round((1 - up) * 25);
+  if (c.out) oy = Math.round(Math.min(1, (NOW - c.out) / 150) * 25);
+  if (c.prev && tin < 1) drawPageAt(c.prev, 0);
+  if (c.banner) { drawBannerAt(c, oy); CUR.vis = false; MS.show = false; return; }
+  drawPageAt(c, oy);
+  if (oy === 0) {
+    const D = SPOOL.docs[c.d];
+    fill(0, 24, 80, 1, ' ', DGR, K0);
+    put(1, 24, 'PRINT  ' + (D.full || D.name) + '    ' + (c.d + 1) + ' of ' + SPOOL.docs.length, DGR, K0);
+  }
+  CUR.vis = false; MS.show = false;
+};
+
+// ---------------------------------------------------------------- the banner, unrolled
+// Print Shop sets the letters on their sides down a strip of fanfold; held up the other way it reads across, and it is
+// longer than anything that will hold it, so it goes past. After it, the right way up, whatever else was in the file.
+const BANNER_TEXT = 'PREPARE TO MEET THY GOD', BANNER_S = 2;
+function bannerColumns() {
+  const cols = [];
+  for (const ch of BANNER_TEXT) {
+    const g = BIGF[ch] || BIGF[' '];
+    for (let i = 0; i < g[0].length; i++) { let bits = 0; for (let r = 0; r < 6; r++) if (g[r][i] === '#') bits |= 1 << r; for (let s = 0; s < BANNER_S; s++) cols.push(bits); }
+    for (let s = 0; s < BANNER_S; s++) cols.push(0);
+  }
+  return cols;
+}
+PAGE.banner = function (ms = 3400) {
+  const d = PAGE.doc('BANNER.TXT');
+  if (d < 0 || SPOOL.docs[d].start < 0 || FX.off) return Promise.resolve(false);
+  return new Promise(res => {
+    const prev = PAGE.cur; if (prev) prev.res(true);
+    const cur = { d, t0: NOW, ms, res, banner: true, cols: bannerColumns(), out: 0 };
+    PAGE.cur = cur;
+    AU.tear(1);
+    after(ms, () => {
+      if (PAGE.cur !== cur) return;
+      cur.out = NOW;
+      after(150, () => { if (PAGE.cur === cur) { PAGE.cur = null; AU.leaf(0.5); } res(true); });
+    });
+  });
+};
+function drawBannerAt(c, oy) {
+  const tail = ['Insert new diskette for drive A:', 'and press ENTER when ready . . .'];
+  const total = c.cols.length + 6 + tail[0].length;            // the letters, a gap, and the two lines after them
+  const k = Math.min(1, (NOW - c.t0) / c.ms), e = k * k * (3 - 2 * k) * 0.25 + k * 0.75;
+  const x0 = Math.round(8 + (72 - total - 8) * e);             // from its first letters at the left to its last lines at the right
+  const top = 5 + oy, bot = 19 + oy;
+  for (let y = Math.max(0, oy); y < 25; y++) fill(0, y, 80, 1, ' ', DGR, K0);
+  for (let y = top; y <= bot; y++) {
+    if (y < 0 || y > 24) continue;
+    fill(0, y, 80, 1, ' ', DGR, WHT);
+    for (let x = 0; x < 80; x++) {
+      const px = x - x0;                                       // the paper's own column, so the holes and folds go past with it
+      if (y === top || y === bot) { if (((px % 2) + 2) % 2 === 0) put(x, y, '○', LGR, WHT); }
+      else if (y === top + 1 || y === bot - 1) { put(x, y, '·', LGR, WHT); }
+      else if (((px % 66) + 66) % 66 === 0) put(x, y, ':', LGR, WHT);   // a fold of the fanfold
+    }
+  }
+  // the letters, in half-block pixels, six tall at twice the size
+  const py0 = (top + 3) * 2;
+  for (let x = 0; x < 80; x++) {
+    const i = x - x0;
+    if (i < 0 || i >= c.cols.length) continue;
+    const bits = c.cols[i];
+    for (let r = 0; r < 6; r++) if (bits & (1 << r)) for (let s = 0; s < BANNER_S; s++) pset(x, py0 + r * BANNER_S + s + oy * 0, DGR);
+  }
+  const tx = x0 + c.cols.length + 6;
+  tail.forEach((l, j) => { for (let i = 0; i < l.length; i++) { const x = tx + i; if (x >= 0 && x < 80) put(x, top + 6 + j, l[i], DGR, WHT); } });
+}
+
+// ---- 27_power.js
+// The machine before it is on. Whoever opens the page finds it switched off on the desk: the monitor dark, the case, the
+// red rocker. The first key or click is a thumb on that rocker, and it is also the touch the browser waits for before it
+// will let a page make a sound, so the switch, the fan, the degaussing and the drives spinning up all arrive at once.
+// Nobody comes for a while and it turns itself on anyway, without the sound. It was going to.
+
+const POWER = { state: 'off', t0: 0, fx: null, by: null };
+
+// the glass of the monitor in the drawing, in cells and in the 640x400 bitmap (it has the screen's own proportions, so the
+// zoom ends exactly on it)
+const GLASS = { x: 24, y: 1, w: 32, h: 10, px: 192, py: 16, pw: 256, ph: 160 };
+
+POWER.draw = function () {
+  const on = POWER.state === 'on', t = NOW - POWER.t0;
+  cls(LGR, K0);
+  // ---- the desk, at night
+  for (let px = 0; px < 80; px++) pset(px, 44, BRN);
+  // ---- the monitor
+  const bx0 = 21, bx1 = 58, by0 = 0, by1 = 25;                          // the bezel, in half-block pixels
+  for (let py = by0; py <= by1; py++) for (let px = bx0; px <= bx1; px++) {
+    const corner = (px === bx0 || px === bx1) && (py === by0 || py === by1);
+    if (corner) continue;
+    let c = LGR;
+    if (py === by0 || px === bx0) c = WHT;
+    else if (py === by1 || px === bx1) c = DGR;
+    pset(px, py, c);
+  }
+  // the recess round the glass: in shadow above and to the left, catching the light below and to the right
+  const gx0 = GLASS.x - 1, gx1 = GLASS.x + GLASS.w, gy0 = GLASS.y * 2 - 1, gy1 = (GLASS.y + GLASS.h) * 2;
+  for (let px = gx0; px <= gx1; px++) { pset(px, gy0, DGR); pset(px, gy1, WHT); }
+  for (let py = gy0; py <= gy1; py++) { pset(gx0, py, DGR); pset(gx1, py, WHT); }
+  pset(gx1, gy0, LGR); pset(gx0, gy1, LGR);
+  // the glass
+  const G0 = GLASS.y * 2, G1 = (GLASS.y + GLASS.h) * 2 - 1, mid = (G0 + G1) >> 1;
+  for (let py = G0; py <= G1; py++) for (let px = GLASS.x; px < GLASS.x + GLASS.w; px++) pset(px, py, K0);
+  // its corners, curved
+  for (const [cx, cy, sx, sy] of [[GLASS.x, G0, 1, 1], [GLASS.x + GLASS.w - 1, G0, -1, 1], [GLASS.x, G1, 1, -1], [GLASS.x + GLASS.w - 1, G1, -1, -1]]) {
+    pset(cx, cy, DGR); pset(cx + sx, cy, DGR); pset(cx, cy + sy, DGR);
+  }
+  if (!on) {
+    // switched off it is a mirror for the room: the tube light over the desk, and a glint at the corner
+    for (let px = 33; px <= 45; px += 2) pset(px, G0 + 2, DGR);
+    pset(26, G0 + 5, DGR); pset(27, G0 + 4, DGR); pset(28, G0 + 3, DGR); pset(29, G0 + 2, DGR);
+    pset(26, G0 + 7, DGR); pset(27, G0 + 6, DGR);
+  } else if (t > 520) {
+    // and on, the beam finding itself: a line across the middle of the tube, drawn out from the centre
+    const half = Math.min(15, Math.floor((t - 520) / 22));
+    for (let px = 40 - half; px < 40 + half; px++) pset(px, mid, Math.abs(px - 39.5) < half - 3 ? WHT : LGR);
+  }
+  // the strip under the glass: two knobs, and the monitor's own lamp
+  pset(46, 23, DGR); pset(48, 23, DGR);
+  pset(53, 23, on ? LGN : DGR);
+  // the stand
+  for (let px = 33; px <= 46; px++) pset(px, 26, DGR);
+  for (let px = 34; px <= 45; px++) pset(px, 27, LGR);
+
+  // ---- the case
+  const cx0 = 3, cx1 = 76, cy0 = 28, cy1 = 43;
+  for (let py = cy0; py <= cy1; py++) for (let px = cx0; px <= cx1; px++) {
+    const corner = (px === cx0 || px === cx1) && (py === cy0 || py === cy1);
+    if (corner) continue;
+    let c = LGR;
+    if (py === cy0 || px === cx0) c = WHT;
+    else if (py === cy1 || px === cx1) c = DGR;
+    pset(px, py, c);
+  }
+  // the badge, pressed into the plastic
+  bigText(6, 15, '286XL+', DGR, LGR);
+  // the lamps
+  const hddOn = on && t > 300 && (((t / 70) | 0) * 2654435761 >>> 0) % 100 < (t < 1500 ? 45 : 20);
+  const fdOn = on && t > 900 && t < 1700;
+  put(6, 19, '■', on ? LGN : DGR, LGR); put(8, 19, 'POWER', DGR, LGR);
+  put(15, 19, '■', on ? YEL : DGR, LGR); put(17, 19, 'TURBO', DGR, LGR);
+  put(24, 19, '■', hddOn ? LRD : DGR, LGR); put(26, 19, 'HDD', DGR, LGR);
+  // the buttons, and the key that locks the keyboard
+  put(31, 19, ' TURBO ', LGR, DGR); put(39, 19, ' RESET ', LGR, DGR);
+  for (let px = 32; px <= 38; px++) pset(px, 40, DGR);
+  for (let px = 40; px <= 46; px++) pset(px, 40, DGR);
+  put(38, 16, 'Θ', DGR, LGR);
+  // drive A: a 5.25" drive with the tract still in it, its lever turned down across the slot
+  fill(48, 15, 21, 3, ' ', LGR, DGR);
+  for (let px = 49; px <= 66; px++) pset(px, 32, K0);
+  for (let py = 30; py <= 35; py++) pset(58, py, LGR);
+  pset(67, 31, fdOn ? LGN : K0);
+  put(63, 17, '1.2M', LGR, DGR);
+  // drive B: nothing behind it
+  frame(48, 18, 21, 3, 's', DGR, LGR);
+  // the power switch: a red rocker. off, the I side stands up; on, it is pressed in and lit from inside.
+  fill(71, 15, 5, 5, ' ', K0, DGR);
+  if (!on) {
+    put(72, 16, ' I ', WHT, LRD);
+    put(72, 17, '▄▄▄', RED, LRD);
+    put(72, 18, ' O ', LRD, RED);
+  } else {
+    const lit = t >= 90;
+    put(72, 16, ' I ', lit ? YEL : WHT, lit ? LRD : RED);
+    put(72, 17, '▀▀▀', lit ? LRD : RED, lit ? LRD : RED);
+    put(72, 18, ' O ', lit ? WHT : LRD, lit ? LRD : RED);
+    if (lit) for (const [x, y] of [[71, 16], [75, 16], [71, 17], [75, 17], [71, 18], [75, 18]]) put(x, y, '░', RED, DGR);
+  }
+  put(71, 20, 'POWER', DGR, LGR);
+
+  // ---- the keyboard, the one with the springs in it
+  for (let px = 6; px <= 73; px++) {
+    pset(px, 45, (px === 6 || px === 73) ? LGR : WHT);
+    for (let py = 46; py <= 48; py++) {
+      const gap = py === 47 || (py === 46 && (px - 7) % 3 === 2) || (py === 48 && (px < 26 || px > 50) && (px - 7) % 3 === 2);
+      pset(px, py, px === 6 || px === 73 ? LGR : gap ? DGR : LGR);
+    }
+    pset(px, 49, DGR);
+  }
+  for (const px of [54, 55, 62]) for (let py = 46; py <= 48; py++) pset(px, py, DGR);   // the gaps before the arrows and the keypad
+  pset(65, 46, on ? LGN : DGR); pset(68, 46, on ? LGN : DGR); pset(71, 46, DGR);          // its three lamps
+};
+
+// the switch, thrown: the lamps and the noise, a moment of the room, then into the glass and the tube coming on
+POWER.throwSwitch = async function (o = {}) {
+  POWER.state = 'on'; POWER.t0 = NOW; POWER.by = o.by || 'you';
+  AU.machWanted = true;
+  if (AU.on) { AU.roomOn(0.5); AU.powerOn({ switch: true }); }
+  await wait(1100);
+  POWER.fx = { kind: 'zoom', t0: NOW, ms: 620 };
+  await wait(640);
+  POWER.fx = null;
+};
+// the tube: a line that opens into a picture, a touch too big before it settles, brightening as the cathode warms
+POWER.crtOn = function (ms = 950) { POWER.fx = { kind: 'crt', t0: NOW, ms }; };
+
+// the first boot: wait for a hand, or for a browser that already allows sound, or for nobody at all
+POWER.gate = async function () {
+  const show = Q.get('panel') === '1' || (!MANUAL && Q.get('panel') !== '0');
+  if (!show) { POWER.state = 'on'; AU.machWanted = true; if (AU.on) AU.powerOn({}); POWER.crtOn(); return; }
+  const prev = BASE;
+  BASE = { name: 'power', draw: POWER.draw };
+  POWER.state = 'off'; POWER.t0 = NOW;
+  AU.init();
+  let by = null;
+  const h = {
+    modal: true,
+    key(ev) { if (ev.src === 'you' && !by) by = 'you'; return true; },
+    mouse(ev) { if (ev.type === 'down' && ev.src === 'you' && !by) by = 'you'; return true; },
+  };
+  pushH(h);
+  try {
+    const t0 = NOW;
+    while (!by) {
+      if (AU.on && NOW - t0 > 1100) by = 'sound';                 // this browser already lets it make a sound
+      else if (NOW - t0 > (+Q.get('selfon') || 15000)) by = 'self';
+      await wait(40);
+    }
+    if (by === 'you') { const tw = NOW; while (!AU.on && AU.ctx && !AU.muted && NOW - tw < 450) await wait(16); }
+    await POWER.throwSwitch({ by });
+  } finally { popH(h); BASE = prev; }
+  POWER.crtOn();
+};
+
+// drawn over the bitmap as it goes to the window
+POWER.drawFx = function (ctx) {
+  const fx = POWER.fx;
+  if (!fx) return false;
+  const k = (NOW - fx.t0) / fx.ms;
+  if (fx.kind === 'zoom') {
+    const e = ease(Math.min(1, Math.max(0, k)));
+    const sx = GLASS.px * e, sy = GLASS.py * e, sw = 640 + (GLASS.pw - 640) * e, sh = 400 + (GLASS.ph - 400) * e;
+    ctx.drawImage(VGA, sx, sy, sw, sh, VIEW.ox, VIEW.oy, VIEW.w, VIEW.h);
+    return true;
+  }
+  if (k >= 1) { POWER.fx = null; return false; }
+  const open = ease(Math.min(1, k / 0.16));
+  const settle = k < 0.16 ? 1 : 1 + 0.022 * Math.exp(-(k - 0.16) * 6) * Math.cos((k - 0.16) * 18);
+  const bright = Math.pow(Math.min(1, Math.max(0, (k - 0.04) / 0.62)), 0.8);
+  const w = VIEW.w * settle, h = Math.max(2, VIEW.h * open * settle);
+  const x = VIEW.ox + (VIEW.w - w) / 2, y = VIEW.oy + (VIEW.h - h) / 2;
+  ctx.globalAlpha = bright;
+  ctx.drawImage(VGA, 0, 0, 640, 400, x, y, w, h);
+  ctx.globalAlpha = 1;
+  const ra = 0.10 * Math.max(0, 1 - k * 1.4);
+  if (ra > 0.005) { ctx.fillStyle = 'rgba(150,160,170,' + ra.toFixed(3) + ')'; ctx.fillRect(x, y, w, h); }
+  const la = (1 - open) * 0.95;
+  if (la > 0.01) { const lh = Math.max(2, VIEW.s * 2); ctx.fillStyle = 'rgba(235,245,255,' + la.toFixed(3) + ')'; ctx.fillRect(VIEW.ox, VIEW.oy + VIEW.h / 2 - lh / 2, VIEW.w, lh); }
+  return true;
+};
+
+// ---- 28_ansi.js
+// What the pack was drawn with. A piece is painted as light into a field of quarter-cells, 160 across and 50 down, and the
+// field is then set in type: every cell becomes the one character of code page 437, in the one pair of colours, that comes
+// nearest to the light that fell on it. Shading falls out of that as ░ ▒ ▓, edges as ▀ ▄ ▌ ▐, and any of the sixteen
+// colours may stand behind a cell as well as in front of it, which is what iCE colour was.
+
+// ---------------------------------------------------------------- the field
+const AFW = 160, AFH = 50, AFN = AFW * AFH;
+const AF = new Float32Array(AFN * 3);           // light, as sRGB 0..255, one sample per quarter cell
+const AP = PAL0;                                // the sixteen, as light
+const ALL16 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const lerp = (a, b, k) => a + (b - a) * k;
+const sstep = (a, b, x) => { const k = clamp01((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+const fract = (v) => v - Math.floor(v);
+function mixc(a, b, k) { return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k]; }
+// a run of colours: stops [[pos, colour], ...] in rising order
+function ramp(stops, x) {
+  if (x <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) if (x <= stops[i][0]) {
+    const a = stops[i - 1], b = stops[i];
+    return mixc(a[1], b[1], (x - a[0]) / Math.max(1e-6, b[0] - a[0]));
+  }
+  return stops[stops.length - 1][1];
+}
+// bands of the sixteen with short shaded joins between them, the way the artists coloured: [[pos, colour index], ...]
+function bands(stops, x, tz = 0.04) {
+  if (x <= stops[0][0]) return AP[stops[0][1]];
+  for (let i = 1; i < stops.length; i++) if (x < stops[i][0]) {
+    const a = stops[i - 1], b = stops[i], k = clamp01((x - (b[0] - tz)) / tz);
+    return k <= 0 ? AP[a[1]] : mixc(AP[a[1]], AP[b[1]], k);
+  }
+  return AP[stops[stops.length - 1][1]];
+}
+function ahash(x, y) { let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi, u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const a = ahash(xi, yi), b = ahash(xi + 1, yi), c = ahash(xi, yi + 1), d = ahash(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, oct = 4) { let s = 0, a = 0.5, f = 1, n = 0; for (let i = 0; i < oct; i++) { s += a * vnoise(x * f, y * f); n += a; a *= 0.5; f *= 2.03; } return s / n; }
+
+function aFill(c) { for (let k = 0; k < AFN * 3; k += 3) { AF[k] = c[0]; AF[k + 1] = c[1]; AF[k + 2] = c[2]; } }
+// every sample, with its centre in the 640x400 picture
+function aEach(fn) { let k = 0; for (let j = 0; j < AFH; j++) { const py = j * 8 + 4; for (let i = 0; i < AFW; i++, k += 3) fn(i * 4 + 2, py, k); } }
+// the samples whose centres lie in a box of the picture
+function aRegion(x0, y0, x1, y1, fn) {
+  const i0 = Math.max(0, Math.floor((x0 - 2) / 4)), i1 = Math.min(AFW - 1, Math.ceil((x1 - 2) / 4));
+  const j0 = Math.max(0, Math.floor((y0 - 4) / 8)), j1 = Math.min(AFH - 1, Math.ceil((y1 - 4) / 8));
+  for (let j = j0; j <= j1; j++) { const py = j * 8 + 4; for (let i = i0; i <= i1; i++) fn(i * 4 + 2, py, (j * AFW + i) * 3); }
+}
+function aMix(k, c, a) {
+  if (!(a > 0)) return;
+  if (a >= 1) { AF[k] = c[0]; AF[k + 1] = c[1]; AF[k + 2] = c[2]; return; }
+  AF[k] += (c[0] - AF[k]) * a; AF[k + 1] += (c[1] - AF[k + 1]) * a; AF[k + 2] += (c[2] - AF[k + 2]) * a;
+}
+function aAdd(k, c, a) { AF[k] += c[0] * a; AF[k + 1] += c[1] * a; AF[k + 2] += c[2] * a; }
+function aMul(k, m) { AF[k] *= m; AF[k + 1] *= m; AF[k + 2] *= m; }
+// how much of a sample an edge covers, given the distance to it and the way it faces (samples are 4 wide and 8 tall)
+const aCovN = (d, nx, ny) => clamp01(0.5 - d / Math.max(2, Math.hypot(4 * nx, 8 * ny)));
+const aCov = (d, w = 6) => clamp01(0.5 - d / w);
+
+// ---------------------------------------------------------------- shapes
+function aDisc(cx, cy, r, c, a = 1, ry = r) {
+  aRegion(cx - r - 8, cy - ry - 8, cx + r + 8, cy + ry + 8, (px, py, k) => {
+    const dx = (px - cx) / r, dy = (py - cy) / ry, L = Math.hypot(dx, dy) || 1e-6;
+    const d = (L - 1) * Math.min(r, ry);
+    aMix(k, c, a * aCovN(d, dx / L, dy / L));
+  });
+}
+function aRing(cx, cy, r, th, c, a = 1, ry = r) {
+  aRegion(cx - r - th - 8, cy - ry - th - 8, cx + r + th + 8, cy + ry + th + 8, (px, py, k) => {
+    const dx = (px - cx) / r, dy = (py - cy) / ry, L = Math.hypot(dx, dy) || 1e-6;
+    const d = Math.abs((L - 1) * Math.min(r, ry)) - th / 2;
+    aMix(k, c, a * aCovN(d, dx / L, dy / L));
+  });
+}
+function aRect(x0, y0, x1, y1, c, a = 1) {
+  aRegion(x0 - 4, y0 - 8, x1 + 4, y1 + 8, (px, py, k) => {
+    const cx = clamp01((Math.min(px - x0, x1 - px) + 2) / 4), cy = clamp01((Math.min(py - y0, y1 - py) + 4) / 8);
+    aMix(k, c, a * cx * cy);
+  });
+}
+// a stroke with round ends, w thick
+function aSeg(x0, y0, x1, y1, w, c, a = 1) {
+  const ex = x1 - x0, ey = y1 - y0, ll = ex * ex + ey * ey || 1e-6, m = w / 2 + 8;
+  aRegion(Math.min(x0, x1) - m, Math.min(y0, y1) - m, Math.max(x0, x1) + m, Math.max(y0, y1) + m, (px, py, k) => {
+    const wx = px - x0, wy = py - y0, h = clamp01((wx * ex + wy * ey) / ll), bx = wx - ex * h, by = wy - ey * h, L = Math.hypot(bx, by) || 1e-6;
+    aMix(k, c, a * aCovN(L - w / 2, bx / L, by / L));
+  });
+}
+function sdPoly(px, py, P) {
+  let d = Infinity, s = 1, nx = 0, ny = 1;
+  const n = P.length >> 1;
+  for (let i = 0, j = n - 1; i < n; j = i, i++) {
+    const ax = P[i * 2], ay = P[i * 2 + 1], ex = P[j * 2] - ax, ey = P[j * 2 + 1] - ay, wx = px - ax, wy = py - ay;
+    const h = clamp01((wx * ex + wy * ey) / (ex * ex + ey * ey || 1e-6)), bx = wx - ex * h, by = wy - ey * h, dd = bx * bx + by * by;
+    if (dd < d) { d = dd; nx = bx; ny = by; }
+    const c1 = py >= ay, c2 = py < P[j * 2 + 1], c3 = ex * wy > ey * wx;
+    if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) s = -s;
+  }
+  const L = Math.sqrt(d) || 1e-6;
+  sdPoly.nx = nx / L * s; sdPoly.ny = ny / L * s;
+  return s * L;
+}
+function aPoly(P, c, a = 1) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let i = 0; i < P.length; i += 2) { x0 = Math.min(x0, P[i]); x1 = Math.max(x1, P[i]); y0 = Math.min(y0, P[i + 1]); y1 = Math.max(y1, P[i + 1]); }
+  aRegion(x0 - 8, y0 - 8, x1 + 8, y1 + 8, (px, py, k) => { const d = sdPoly(px, py, P); aMix(k, c, a * aCovN(d, sdPoly.nx, sdPoly.ny)); });
+}
+// light, added: brightest at the centre and falling away to nothing at r
+function aGlow(cx, cy, r, c, kk = 1, ry = r) {
+  aRegion(cx - r, cy - ry, cx + r, cy + ry, (px, py, k) => {
+    const d = Math.hypot((px - cx) / r, (py - cy) / ry);
+    if (d < 1) { const f = (1 - d) * (1 - d); aAdd(k, c, kk * f); }
+  });
+}
+// the whole field, coloured by height
+function aVGrad(stops, y0 = 0, y1 = 400) {
+  for (let j = 0; j < AFH; j++) {
+    const py = j * 8 + 4; if (py < y0 || py > y1) continue;
+    const c = ramp(stops, py);
+    for (let i = 0, k = j * AFW * 3; i < AFW; i++, k += 3) { AF[k] = c[0]; AF[k + 1] = c[1]; AF[k + 2] = c[2]; }
+  }
+}
+
+// ---------------------------------------------------------------- setting the field in type
+const AQ = { T: 0.22, split: 0, cov: null, sets: new Map() };
+const aqLin = (v) => Math.pow(Math.max(0, v) / 255, 2.2), aqUnlin = (v) => 255 * Math.pow(Math.max(0, v), 1 / 2.2);
+function aqErr(r, g, b, R, G, B) { const dr = r - R, dg = g - G, db = b - B; return 3 * dr * dr + 4 * dg * dg + 2 * db * db; }
+function aqCov() {
+  if (AQ.cov) return AQ.cov;
+  const c = (ch) => { let n = 0; for (let r = 0; r < 16; r++) { let b = FONT16[ch * 16 + r]; while (b) { n += b & 1; b >>= 1; } } return n / 128; };
+  return (AQ.cov = [c(0xB0), c(0xB1), c(0xB2)]);
+}
+// the characters a palette can make: each colour solid, and every pair of colours shaded one into the other
+function aqSet(pal, T = AQ.T) {
+  const key = pal.join(',') + '/' + T;
+  let s = AQ.sets.get(key);
+  if (s) return s;
+  const cov = aqCov(), C = [], CH = [], FG = [], BG = [];
+  for (const f of pal) { C.push(AP[f][0], AP[f][1], AP[f][2], 0); CH.push(0xDB); FG.push(f); BG.push(f); }
+  for (const f of pal) for (const b of pal) if (f !== b) for (let i = 0; i < 3; i++) {
+    const c = cov[i], F = AP[f], B = AP[b];
+    C.push(aqUnlin(c * aqLin(F[0]) + (1 - c) * aqLin(B[0])), aqUnlin(c * aqLin(F[1]) + (1 - c) * aqLin(B[1])), aqUnlin(c * aqLin(F[2]) + (1 - c) * aqLin(B[2])),
+      T * c * (1 - c) * aqErr(F[0], F[1], F[2], B[0], B[1], B[2]));
+    CH.push(0xB0 + i); FG.push(f); BG.push(b);
+  }
+  s = { pal, C: Float32Array.from(C), CH: Uint8Array.from(CH), FG: Uint8Array.from(FG), BG: Uint8Array.from(BG), n: CH.length,
+    lut: new Int16Array(32768).fill(-1), near: new Int8Array(32768).fill(-1) };
+  AQ.sets.set(key, s);
+  return s;
+}
+const aqKey = (r, g, b) => ((Math.min(255, Math.max(0, r)) >> 3) << 10) | ((Math.min(255, Math.max(0, g)) >> 3) << 5) | (Math.min(255, Math.max(0, b)) >> 3);
+function aqBest(s, r, g, b) {
+  const key = aqKey(r, g, b);
+  let i = s.lut[key];
+  if (i >= 0) return i;
+  const R = ((key >> 10) << 3) + 4, G = (((key >> 5) & 31) << 3) + 4, B = ((key & 31) << 3) + 4, C = s.C;
+  let best = Infinity;
+  for (let c = 0; c < s.n; c++) { const e = aqErr(R, G, B, C[c * 4], C[c * 4 + 1], C[c * 4 + 2]) * 4 + C[c * 4 + 3]; if (e < best) { best = e; i = c; } }
+  s.lut[key] = i;
+  return i;
+}
+function aqNear(s, r, g, b) {
+  const key = aqKey(r, g, b);
+  let i = s.near[key];
+  if (i >= 0) return i;
+  const R = ((key >> 10) << 3) + 4, G = (((key >> 5) & 31) << 3) + 4, B = ((key & 31) << 3) + 4;
+  let best = Infinity;
+  for (const f of s.pal) { const e = aqErr(R, G, B, AP[f][0], AP[f][1], AP[f][2]); if (e < best) { best = e; i = f; } }
+  s.near[key] = i;
+  return i;
+}
+const AQV = new Float32Array(12);
+// the field, set: o.pal limits the colours, o.x0..o.x1 / o.y0..o.y1 limit the cells
+function aQuant(o = {}) {
+  const s = aqSet(o.pal || ALL16, o.T == null ? AQ.T : o.T), B = TGT, C = s.C, q = AQV, SP = o.split == null ? AQ.split : o.split;
+  const x0 = o.x0 || 0, x1 = o.x1 == null ? 79 : o.x1, y0 = o.y0 || 0, y1 = o.y1 == null ? 24 : o.y1;
+  for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++) {
+    const k0 = (cy * 2 * AFW + cx * 2) * 3, ks = [k0, k0 + 3, k0 + AFW * 3, k0 + AFW * 3 + 3];
+    let ar = 0, ag = 0, ab = 0;
+    for (let n = 0; n < 4; n++) {
+      const k = ks[n], r = AF[k], g = AF[k + 1], b = AF[k + 2];
+      q[n * 3] = r < 0 ? 0 : r > 255 ? 255 : r; q[n * 3 + 1] = g < 0 ? 0 : g > 255 ? 255 : g; q[n * 3 + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+      ar += q[n * 3]; ag += q[n * 3 + 1]; ab += q[n * 3 + 2];
+    }
+    ar /= 4; ag /= 4; ab /= 4;
+    // one colour, or two shaded together
+    const ci = aqBest(s, ar, ag, ab), mr = C[ci * 4], mg = C[ci * 4 + 1], mb = C[ci * 4 + 2];
+    let best = C[ci * 4 + 3];
+    for (let n = 0; n < 4; n++) best += aqErr(q[n * 3], q[n * 3 + 1], q[n * 3 + 2], mr, mg, mb);
+    let ch = s.CH[ci], fg = s.FG[ci], bg = s.BG[ci];
+    // the top against the bottom
+    const ct = aqNear(s, (q[0] + q[3]) / 2, (q[1] + q[4]) / 2, (q[2] + q[5]) / 2), cb = aqNear(s, (q[6] + q[9]) / 2, (q[7] + q[10]) / 2, (q[8] + q[11]) / 2);
+    if (ct !== cb) {
+      const T = AP[ct], U = AP[cb];
+      const e = SP + aqErr(q[0], q[1], q[2], T[0], T[1], T[2]) + aqErr(q[3], q[4], q[5], T[0], T[1], T[2]) + aqErr(q[6], q[7], q[8], U[0], U[1], U[2]) + aqErr(q[9], q[10], q[11], U[0], U[1], U[2]);
+      if (e < best) { best = e; ch = 0xDF; fg = ct; bg = cb; }
+    }
+    // the left against the right
+    const cl = aqNear(s, (q[0] + q[6]) / 2, (q[1] + q[7]) / 2, (q[2] + q[8]) / 2), cr = aqNear(s, (q[3] + q[9]) / 2, (q[4] + q[10]) / 2, (q[5] + q[11]) / 2);
+    if (cl !== cr) {
+      const T = AP[cl], U = AP[cr];
+      const e = SP + aqErr(q[0], q[1], q[2], T[0], T[1], T[2]) + aqErr(q[6], q[7], q[8], T[0], T[1], T[2]) + aqErr(q[3], q[4], q[5], U[0], U[1], U[2]) + aqErr(q[9], q[10], q[11], U[0], U[1], U[2]);
+      if (e < best) { best = e; ch = 0xDD; fg = cl; bg = cr; }
+    }
+    const k = cy * W + cx;
+    B.ch[k] = ch; B.fg[k] = fg; B.bg[k] = bg; B.bl[k] = 0;
+  }
+}
+// the colour of the light behind a cell, as one of the sixteen
+function aCellNear(cx, cy, pal = ALL16) {
+  const k0 = (cy * 2 * AFW + cx * 2) * 3, k2 = k0 + AFW * 3;
+  return aqNear(aqSet(pal), (AF[k0] + AF[k0 + 3] + AF[k2] + AF[k2 + 3]) / 4, (AF[k0 + 1] + AF[k0 + 4] + AF[k2 + 1] + AF[k2 + 4]) / 4, (AF[k0 + 2] + AF[k0 + 5] + AF[k2 + 2] + AF[k2 + 5]) / 4);
+}
+// words set into the picture: each letter takes the light behind it for its background
+function aText(x, y, s, fg, o = {}) {
+  s = String(s);
+  for (let i = 0; i < s.length; i++) {
+    const cx = x + i;
+    if (cx < 0 || cx >= W || y < 0 || y >= H || (s[i] === ' ' && !o.solid)) continue;
+    put(cx, y, s[i], fg, o.bg != null ? o.bg : aCellNear(cx, y));
+  }
+}
+function aCenter(y, s, fg, o = {}) { aText(Math.floor((W - s.length) / 2) + (o.dx || 0), y, s, fg, o); }
+
+// ---------------------------------------------------------------- the pack's letters
+// Drawn on a grid of tiles, five across and seven down; a tile is full (#), empty (.), or cut corner to corner and half
+// full (◢ ◣ ◤ ◥). Made bold, outlined, bevelled, lit and thrown into depth by the distance from every point to the edge.
+const LGF = {
+  "A": "◢###◣|#...#|#...#|#####|#...#|#...#|#...#", "B": "####◣|#...#|#...#|####◤|#...◣|#...#|####◤",
+  "C": "◢###◣|#...#|#....|#....|#....|#...#|◥###◤", "D": "####◣|#...#|#...#|#...#|#...#|#...#|####◤",
+  "E": "#####|#....|#....|####.|#....|#....|#####", "F": "#####|#....|#....|####.|#....|#....|#....",
+  "G": "◢###◣|#...#|#....|#.###|#...#|#...#|◥####", "H": "#...#|#...#|#...#|#####|#...#|#...#|#...#",
+  "I": "###|.#.|.#.|.#.|.#.|.#.|###", "J": "....#|....#|....#|....#|#...#|#...#|◥###◤",
+  "K": "#..◢◤|#.◢◤.|#◢◤..|##...|#◥◣..|#.◥◣.|#..◥◣", "L": "#....|#....|#....|#....|#....|#....|#####",
+  "M": "#◣.◢#|##.##|#◥#◤#|#...#|#...#|#...#|#...#", "N": "#...#|#◣..#|##◣.#|#◥#◣#|#.◥##|#..◥#|#...#",
+  "O": "◢###◣|#...#|#...#|#...#|#...#|#...#|◥###◤", "P": "####◣|#...#|#...#|####◤|#....|#....|#....",
+  "Q": "◢###◣|#...#|#...#|#...#|#.◥◣#|#..◥◣|◥###◥", "R": "####◣|#...#|#...#|####◤|#◥◣..|#.◥◣.|#..◥◣",
+  "S": "◢###◣|#...#|#....|◥###◣|....#|#...#|◥###◤", "T": "#####|..#..|..#..|..#..|..#..|..#..|..#..",
+  "U": "#...#|#...#|#...#|#...#|#...#|#...#|◥###◤", "V": "#...#|#...#|#...#|#...#|◥◣.◢◤|.#.#.|.◥#◤.",
+  "W": "#...#|#...#|#...#|#...#|#.#.#|#◢#◣#|#◤.◥#", "X": "#...#|◥◣.◢◤|.◥◣◤.|..#..|.◢◤◣.|◢◤.◥◣|#...#",
+  "Y": "#...#|#...#|◥◣.◢◤|.◥#◤.|..#..|..#..|..#..", "Z": "#####|...◢◤|..◢◤.|.◢◤..|◢◤...|#....|#####",
+  "0": "◢###◣|#...#|#..◢#|#.◢◤#|#◢◤.#|#...#|◥###◤", "1": ".◢#.|◢◤#.|..#.|..#.|..#.|..#.|.###",
+  "2": "◢###◣|#...#|....#|..◢#◤|.◢◤..|◢◤...|#####", "3": "◢###◣|#...#|....#|..##◤|....#|#...#|◥###◤",
+  "4": "...#.|..◢#.|.◢◤#.|◢◤.#.|#####|...#.|...#.", "5": "#####|#....|####◣|....#|....#|#...#|◥###◤",
+  "6": "◢###◣|#....|#....|####◣|#...#|#...#|◥###◤", "7": "#####|....#|...◢◤|..◢◤.|..#..|..#..|..#..",
+  "8": "◢###◣|#...#|#...#|◢###◣|#...#|#...#|◥###◤", "9": "◢###◣|#...#|#...#|◥####|....#|....#|◥###◤",
+  "c": ".....|.....|.....|◢####|#....|#....|◥####", ".": ".|.|.|.|.|.|#", ",": ".|.|.|.|.|#|◤", ":": ".|.|#|.|.|#|.",
+  "-": "....|....|....|####|....|....|....", "'": "#|#|.|.|.|.|.", "!": "#|#|#|#|#|.|#", "(": "◢#|#.|#.|#.|#.|#.|◥#",
+  ")": "#◣|.#|.#|.#|.#|.#|#◤", "/": "....#|...◢◤|..◢◤.|.◢◤..|◢◤...|#....|.....", "|": "#|#|#|#|#|#|#",
+  "=": "....|....|####|....|####|....|....", "?": "◢###◣|#...#|....#|..◢#◤|..#..|.....|..#..",
+};
+function lgfInside(t, fx, fy) {
+  if (t === '#') return true;
+  if (t === '◢') return fx + fy >= 1;
+  if (t === '◣') return fy >= fx;
+  if (t === '◤') return fx + fy <= 1;
+  if (t === '◥') return fx >= fy;
+  return false;
+}
+// the squared distance from every cell of a grid to the nearest marked one (Felzenszwalb and Huttenlocher)
+function edt1(f, n, d, v, z) {
+  let k = 0; v[0] = 0; z[0] = -1e20; z[1] = 1e20;
+  for (let q = 1; q < n; q++) {
+    let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+    k++; v[k] = q; z[k] = s; z[k + 1] = 1e20;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; const dq = q - v[k]; d[q] = dq * dq + f[v[k]]; }
+}
+function edt(mark, w, h) {
+  const out = new Float64Array(w * h), n = Math.max(w, h);
+  const f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  for (let i = 0; i < w * h; i++) out[i] = mark[i] ? 0 : 1e20;
+  for (let x = 0; x < w; x++) { for (let y = 0; y < h; y++) f[y] = out[y * w + x]; edt1(f, h, d, v, z); for (let y = 0; y < h; y++) out[y * w + x] = d[y]; }
+  for (let y = 0; y < h; y++) { for (let x = 0; x < w; x++) f[x] = out[y * w + x]; edt1(f, w, d, v, z); for (let x = 0; x < w; x++) out[y * w + x] = d[x]; }
+  return out;
+}
+// a mask as signed distance, in pixels: negative inside
+function sdfOf(mask, w, h, res) {
+  const inv = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) inv[i] = mask[i] ? 0 : 1;
+  const dIn = edt(mask, w, h), dOut = edt(inv, w, h), sd = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) sd[i] = (mask[i] ? -(Math.sqrt(dOut[i]) - 0.5) : Math.sqrt(dIn[i]) - 0.5) * res;
+  return sd;
+}
+const LOGOS = new Map();
+// a word, ready to be drawn: tw x th pixels a tile, gap tiles between letters, space tiles for a space
+function aLogoBuild(text, o = {}) {
+  const tw = o.tw || 12, th = o.th || 12, gap = o.gap == null ? 1 : o.gap, res = o.res || 2, M = o.margin == null ? 48 : o.margin;
+  const key = [text, tw, th, gap, res, M, o.space || 3, o.round || 0].join('|');
+  if (LOGOS.has(key)) return LOGOS.get(key);
+  const place = [];
+  let wt = 0;
+  for (const ch of text) {
+    if (ch === ' ') { wt += o.space || 3; continue; }
+    const g = LGF[ch] || LGF[ch.toUpperCase()];
+    if (!g) { wt += 3; continue; }
+    const rows = g.split('|');
+    place.push({ x: wt, rows, w: rows[0].length }); wt += rows[0].length + gap;
+  }
+  if (place.length) wt -= gap;
+  const Wp = wt * tw, Hp = 7 * th, gw = Math.ceil((Wp + 2 * M) / res), gh = Math.ceil((Hp + 2 * M) / res);
+  let mask = new Uint8Array(gw * gh);
+  for (const p of place) for (let r = 0; r < 7; r++) for (let c = 0; c < p.w; c++) {
+    const t = p.rows[r][c];
+    if (t === '.' || t == null) continue;
+    const tx0 = (p.x + c) * tw + M, ty0 = r * th + M;
+    for (let gy = Math.floor(ty0 / res); gy <= Math.ceil((ty0 + th) / res); gy++) for (let gx = Math.floor(tx0 / res); gx <= Math.ceil((tx0 + tw) / res); gx++) {
+      if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) continue;
+      const fx = ((gx + 0.5) * res - tx0) / tw, fy = ((gy + 0.5) * res - ty0) / th;
+      if (fx >= 0 && fx < 1 && fy >= 0 && fy < 1 && lgfInside(t, fx, fy)) mask[gy * gw + gx] = 1;
+    }
+  }
+  if (o.round) {
+    // soften the corners: blur, then cut at half
+    const r = Math.max(1, Math.round(o.round / res)), a = new Float32Array(gw * gh), b = new Float32Array(gw * gh);
+    for (let i = 0; i < gw * gh; i++) a[i] = mask[i];
+    for (let pass = 0; pass < 2; pass++) {
+      for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) { let s = 0, n = 0; for (let k = -r; k <= r; k++) { const xx = x + k; if (xx >= 0 && xx < gw) { s += a[y * gw + xx]; n++; } } b[y * gw + x] = s / n; }
+      for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) { let s = 0, n = 0; for (let k = -r; k <= r; k++) { const yy = y + k; if (yy >= 0 && yy < gh) { s += b[yy * gw + x]; n++; } } a[y * gw + x] = s / n; }
+    }
+    mask = new Uint8Array(gw * gh);
+    for (let i = 0; i < gw * gh; i++) mask[i] = a[i] >= 0.5 ? 1 : 0;
+  }
+  // each letter's own top and foot, so a short letter can be coloured top to bottom like a tall one
+  const vt = new Float32Array(Math.max(1, Wp)), vb = new Float32Array(Math.max(1, Wp));
+  for (let i = 0; i < Wp; i++) { vt[i] = 0; vb[i] = Hp; }
+  for (let gi = 0; gi < place.length; gi++) {
+    const p = place[gi];
+    let r0 = 7, r1 = -1;
+    for (let r = 0; r < 7; r++) if (/[^.]/.test(p.rows[r])) { r0 = Math.min(r0, r); r1 = Math.max(r1, r); }
+    const nx0 = gi ? (place[gi - 1].x + place[gi - 1].w) * tw : 0, nx1 = gi < place.length - 1 ? place[gi + 1].x * tw : Wp;
+    const a = Math.floor((nx0 + p.x * tw) / 2), b = Math.ceil((nx1 + (p.x + p.w) * tw) / 2);
+    for (let i = Math.max(0, gi ? a : 0); i < Math.min(Wp, gi < place.length - 1 ? b : Wp); i++) { vt[i] = r0 * th; vb[i] = (r1 + 1) * th; }
+  }
+  const L = { text, gw, gh, res, M, w: Wp, h: Hp, tw, th, vt, vb, sd: sdfOf(mask, gw, gh, res) };
+  LOGOS.set(key, L);
+  return L;
+}
+// the distance to the letters' edge at a point measured from the letters' top left corner
+function aLogoD(L, x, y) {
+  const gx = (x + L.M) / L.res - 0.5, gy = (y + L.M) / L.res - 0.5;
+  if (!(gx >= 0 && gy >= 0 && gx < L.gw - 1 && gy < L.gh - 1)) return 99;
+  const ix = gx | 0, iy = gy | 0, fx = gx - ix, fy = gy - iy, i = iy * L.gw + ix, s = L.sd;
+  return (s[i] * (1 - fx) + s[i + 1] * fx) * (1 - fy) + (s[i + L.gw] * (1 - fx) + s[i + L.gw + 1] * fx) * fy;
+}
+// how a bevel catches a light from the upper left: +1 facing it, -1 turned away, 0 on the flat of the face
+function bevelK(d, nx, ny, w) { if (-d > w) return 0; return (-nx * 0.55 - ny * 0.83) * (1 - (-d) / w); }
+// a word drawn: o.x, o.y its top left; o.bold thickens it; o.mat(u, v, d, nx, ny, lx, ly) colours its face;
+// o.outline / o.ow ring it; o.glow / o.gr / o.gk light the air round it; o.extrude { dx, dy, n, col(f) } gives it depth;
+// o.shadow { dx, dy, c, a } throws it on what is behind; o.shear leans it; o.scale grows it from its centre
+function aLogo(L, o) {
+  const b = o.bold || 0, ow = o.outline ? (o.ow == null ? 4 : o.ow) : 0, gr = o.glow ? (o.gr || 16) : 0, ex = o.extrude, sh = o.shear || 0, sc = o.scale || 1;
+  const exn = ex ? ex.n : 0, exl = ex ? Math.hypot(ex.dx, ex.dy) * exn : 0;
+  const pad = (b + ow + gr + exl + 10) * sc + Math.abs(sh) * L.h * sc + (o.shadow ? Math.hypot(o.shadow.dx, o.shadow.dy) : 0);
+  const cxL = o.x + L.w / 2, cyL = o.y + L.h / 2;
+  aRegion(cxL - L.w * sc / 2 - pad, cyL - L.h * sc / 2 - pad, cxL + L.w * sc / 2 + pad, cyL + L.h * sc / 2 + pad, (px, py, k) => {
+    let ly = (py - cyL) / sc + L.h / 2, lx = (px - cxL) / sc + L.w / 2;
+    lx += sh * (L.h - ly);
+    const d = aLogoD(L, lx, ly) - b;
+    let ds = d, side = -1;
+    if (ex) for (let s = 1; s <= exn; s++) {
+      const dd = aLogoD(L, lx - ex.dx * s, ly - ex.dy * s) - b;
+      if (dd < ds) ds = dd;
+      if (side < 0 && dd < 0.5) side = s;
+    }
+    if (gr && ds > 0 && ds < gr) { const f = 1 - ds / gr; aAdd(k, o.glow, (o.gk == null ? 0.8 : o.gk) * f * f); }
+    if (o.shadow) { const dd = aLogoD(L, lx - o.shadow.dx, ly - o.shadow.dy) - b; if (dd < 3) aMix(k, o.shadow.c, (o.shadow.a == null ? 1 : o.shadow.a) * aCov(dd)); }
+    if (ow && ds < ow + 3) aMix(k, o.outline, aCov(ds - ow));
+    if (side > 0 && d > -3) { const c = ex.col((side - 1) / Math.max(1, exn - 1), lx, ly); aMix(k, c, aCov(ds)); }
+    if (d < 3) {
+      const nx = aLogoD(L, lx + 2, ly) - aLogoD(L, lx - 2, ly), ny = aLogoD(L, lx, ly + 2) - aLogoD(L, lx, ly - 2), nl = Math.hypot(nx, ny) || 1;
+      const ci = Math.max(0, Math.min(L.w - 1, Math.floor(lx))), vl = o.local ? clamp01((ly - L.vt[ci]) / Math.max(1, L.vb[ci] - L.vt[ci])) : clamp01(ly / L.h);
+      const c = o.mat(clamp01(lx / L.w), vl, d, nx / nl, ny / nl, lx, ly);
+      aMix(k, c, aCov(d) * (o.alpha == null ? 1 : o.alpha));
+    }
+  });
+}
+// the materials the pack used most
+const MAT = {
+  // chrome: the sky above the horizon, the ground below, a hard line where they meet, and bevels catching the light
+  chrome(o = {}) {
+    const st = o.bands || [[0, WHT], [0.16, LCY], [0.3, LBL], [0.42, BLU], [0.5, K0], [0.53, BRN], [0.68, YEL], [0.9, WHT]];
+    return (u, v, d, nx, ny) => {
+      let c = bands(st, v, o.tz || 0.05);
+      const bk = bevelK(d, nx, ny, o.bw || 7);
+      if (bk > 0.15) c = mixc(c, o.lit || AP[WHT], Math.min(1, bk * 1.3)); else if (bk < -0.15) c = mixc(c, o.dark || AP[BLU], Math.min(1, -bk * 1.2));
+      return c;
+    };
+  },
+  // metal lit from above, in one colour: bright at the top, dark at the foot, bevelled
+  metal(top, mid, bot, o = {}) {
+    return (u, v, d, nx, ny) => {
+      let c = v < 0.5 ? mixc(top, mid, v * 2) : mixc(mid, bot, (v - 0.5) * 2);
+      const bk = bevelK(d, nx, ny, o.bw || 6);
+      if (bk > 0) c = mixc(c, o.lit || [255, 255, 255], bk); else if (bk < 0) c = mixc(c, o.dark || [0, 0, 0], -bk * 0.85);
+      return c;
+    };
+  },
+};
+
+// ---------------------------------------------------------------- solids
+function sdEll(x, y, z, rx, ry, rz) { const k0 = Math.hypot(x / rx, y / ry, z / rz), k1 = Math.hypot(x / (rx * rx), y / (ry * ry), z / (rz * rz)); return k0 * (k0 - 1) / (k1 || 1e-9); }
+function sdCap(x, y, z, ax, ay, az, bx, by, bz, r0, r1 = r0) {
+  const px = x - ax, py = y - ay, pz = z - az, ex = bx - ax, ey = by - ay, ez = bz - az;
+  const h = clamp01((px * ex + py * ey + pz * ez) / (ex * ex + ey * ey + ez * ez || 1e-9));
+  return Math.hypot(px - ex * h, py - ey * h, pz - ez * h) - (r0 + (r1 - r0) * h);
+}
+function sdTorus(x, y, z, R, r) { return Math.hypot(Math.hypot(x, z) - R, y) - r; }
+function smin(a, b, k) { const h = Math.max(k - Math.abs(a - b), 0) / k; return Math.min(a, b) - h * h * k * 0.25; }
+// a solid as points on its skin, each with the way it faces
+function aSolid(sdf, box, step) {
+  const [x0, y0, z0, x1, y1, z1] = box, P = [], Nn = [], cs = step * 4, h = step * 0.5;
+  for (let cx = x0; cx < x1; cx += cs) for (let cy = y0; cy < y1; cy += cs) for (let cz = z0; cz < z1; cz += cs) {
+    if (Math.abs(sdf(cx + cs / 2, cy + cs / 2, cz + cs / 2)) > cs * 0.9) continue;
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) for (let l = 0; l < 4; l++) {
+      const x = cx + (i + 0.5) * step, y = cy + (j + 0.5) * step, z = cz + (l + 0.5) * step, f = sdf(x, y, z);
+      if (Math.abs(f) > step * 0.62) continue;
+      let nx = sdf(x + h, y, z) - sdf(x - h, y, z), ny = sdf(x, y + h, z) - sdf(x, y - h, z), nz = sdf(x, y, z + h) - sdf(x, y, z - h);
+      const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+      P.push(x - nx * f, y - ny * f, z - nz * f); Nn.push(nx, ny, nz);
+    }
+  }
+  return { P: Float32Array.from(P), N: Float32Array.from(Nn), n: P.length / 3, step };
+}
+const ZB = { w: 320, h: 100, z: new Float32Array(32000), id: new Int32Array(32000), rn: null };
+// turned (yaw about the upright, then pitch), set at o.cx, o.cy at o.scale pixels a unit, each visible point shaded by
+// o.shade(nx, ny, nz, x, y, z) -> colour; drawn into the field with its edges softened
+function aSolidDraw(S, o) {
+  const zb = ZB.z, id = ZB.id;
+  zb.fill(-1e9); id.fill(-1);
+  if (!ZB.rn || ZB.rn.length < S.n * 6) ZB.rn = new Float32Array(S.n * 6);
+  const rn = ZB.rn, cy = Math.cos(o.yaw || 0), sy = Math.sin(o.yaw || 0), cp = Math.cos(o.pitch || 0), sp = Math.sin(o.pitch || 0);
+  const P = S.P, N = S.N, sc = o.scale, f0 = o.persp || 0;
+  let minX = 320, maxX = 0, minY = 100, maxY = 0;
+  for (let i = 0; i < S.n; i++) {
+    const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
+    const x1 = x * cy + z * sy, z1 = -x * sy + z * cy, y2 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
+    const nx = N[i * 3], ny = N[i * 3 + 1], nz = N[i * 3 + 2];
+    const nx1 = nx * cy + nz * sy, nz1 = -nx * sy + nz * cy, ny2 = ny * cp - nz1 * sp, nz2 = ny * sp + nz1 * cp;
+    if (nz2 < -0.25) continue;
+    const pf = f0 ? f0 / (f0 - z2) : 1;
+    const sx = o.cx + x1 * sc * pf, syy = o.cy - y2 * sc * pf;
+    rn[i * 6] = nx1; rn[i * 6 + 1] = ny2; rn[i * 6 + 2] = nz2; rn[i * 6 + 3] = x1; rn[i * 6 + 4] = y2; rn[i * 6 + 5] = z2;
+    const fw = Math.max(1, Math.ceil(S.step * sc * pf / 2)), fh = Math.max(1, Math.ceil(S.step * sc * pf / 4));
+    const tx0 = Math.floor(sx / 2 - fw / 2), ty0 = Math.floor(syy / 4 - fh / 2);
+    for (let ty = ty0; ty < ty0 + fh + 1; ty++) {
+      if (ty < 0 || ty >= 100) continue;
+      for (let tx = tx0; tx < tx0 + fw + 1; tx++) {
+        if (tx < 0 || tx >= 320) continue;
+        const t = ty * 320 + tx;
+        if (z2 > zb[t]) { zb[t] = z2; id[t] = i; }
+      }
+    }
+    if (tx0 < minX) minX = tx0; if (tx0 + fw > maxX) maxX = tx0 + fw; if (ty0 < minY) minY = ty0; if (ty0 + fh > maxY) maxY = ty0 + fh;
+  }
+  // each sample of the field is two texels by two
+  const i0 = Math.max(0, minX >> 1), i1 = Math.min(AFW - 1, (maxX >> 1) + 1), j0 = Math.max(0, minY >> 1), j1 = Math.min(AFH - 1, (maxY >> 1) + 1);
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+      const t = (j * 2 + dy) * 320 + i * 2 + dx, p = id[t];
+      if (p < 0) continue;
+      const c = o.shade(rn[p * 6], rn[p * 6 + 1], rn[p * 6 + 2], rn[p * 6 + 3], rn[p * 6 + 4], rn[p * 6 + 5]);
+      r += c[0]; g += c[1]; b += c[2]; n++;
+    }
+    if (n) aMix((j * AFW + i) * 3, [r / n, g / n, b / n], n / 4);
+  }
+}
+// gold, the way a calf is gold: a warm key light from the upper left, a hard highlight, and the room in it
+function shadeGold(nx, ny, nz, o = {}) {
+  const lx = -0.55, ly = 0.62, lz = 0.56;
+  const diff = Math.max(0, nx * lx + ny * ly + nz * lz);
+  const hx = lx, hy = ly, hz = lz + 1, hl = Math.hypot(hx, hy, hz);
+  const spec = Math.pow(Math.max(0, (nx * hx + ny * hy + nz * hz) / hl), o.shine || 26);
+  const ry = 2 * nz * ny;                                         // where the reflection of the view points
+  const env = sstep(-0.3, 0.7, ry);
+  const rim = Math.pow(1 - Math.max(0, nz), 3) * (o.rim == null ? 0.5 : o.rim);
+  const b = 0.12 + 0.55 * diff + 0.3 * env + spec * 0.9 + rim * 0.35;
+  return ramp(o.stops || GOLD_STOPS, b);
+}
+const GOLD_STOPS = [[0, [50, 8, 0]], [0.22, [150, 50, 0]], [0.4, [175, 95, 5]], [0.62, [235, 180, 40]], [0.85, [255, 245, 110]], [1.05, [255, 255, 255]]];
+
+// ---------------------------------------------------------------- ASCII, for the engravers
+// A picture engraved in nothing but the characters on the keys. region(px, py) names what is at a point (0 for nothing);
+// o.regions[id] = { dir, tone(px, py), ink: [faint, mid, strong], edge } where dir is the way its hatching runs (h, v, u
+// for /, d for \, x crossed, s solid). Edges between regions are drawn as edges: _ - | / \.
+const ENG_RAMP = { h: ' .--==#', v: " ':!||#", u: ' .,//X#', d: ' .`\\\\X#', x: ' .+xX#@', s: ' .:oO@#', n: ' ' };
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+function aEngrave(region, o) {
+  const out = { ch: new Uint8Array(N).fill(32), fg: new Uint8Array(N).fill(LGR) }, R = o.regions, ids = new Int16Array(16);
+  for (let cy = 0; cy < H; cy++) for (let cx = 0; cx < W; cx++) {
+    const k = cy * W + cx;
+    let front = 0, fz = -1;
+    for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
+      const id = region(cx * 8 + i * 2 + 1, cy * 16 + j * 4 + 2);
+      ids[j * 4 + i] = id;
+      const z = id ? (R[id].z == null ? id : R[id].z) : -1;
+      if (z > fz) { fz = z; front = id; }
+    }
+    let n = 0, mx = 0, my = 0;
+    for (let q = 0; q < 16; q++) if (ids[q] === front) { n++; mx += (q & 3) - 1.5; my += (q >> 2) - 1.5; }
+    const cxp = cx * 8 + 4, cyp = cy * 16 + 8;
+    if (!front) continue;
+    const F = R[front];
+    if (n < 16 && F.edge !== false) {
+      // an edge: which way the front region lies decides the stroke
+      const nx = mx * 2, ny = my * 4, L = Math.hypot(nx, ny);
+      if (L > 0.01) {
+        const ux = nx / L, uy = ny / L;
+        let ch;
+        if (Math.abs(uy) > 0.88) ch = uy > 0 ? (n < 7 ? '_' : '-') : (n < 7 ? '`' : '-');
+        else if (Math.abs(ux) > 0.6) ch = Math.abs(uy) < 0.35 ? '|' : (ux * uy < 0 ? '\\' : '/');
+        else ch = ux * uy < 0 ? '\\' : '/';
+        out.ch[k] = cp(ch); out.fg[k] = F.ink[2];
+        continue;
+      }
+    }
+    // the inside: hatching, as dense as the tone
+    const rid = n >= 8 ? front : ids[5];
+    if (!rid) continue;
+    const G = R[rid], ramp = ENG_RAMP[G.dir || 'x'], tone = clamp01(G.tone ? G.tone(cxp, cyp) : 0.5);
+    const tt = clamp01(tone + (BAYER4[(cy & 3) * 4 + (cx & 3)] / 16 - 0.47) / (ramp.length - 1));
+    const idx = Math.min(ramp.length - 1, Math.floor(tt * (ramp.length - 1) + 0.5));
+    out.ch[k] = cp(ramp[idx]);
+    out.fg[k] = G.ink[Math.min(2, Math.floor(tone * 3))];
+  }
+  return out;
+}
+// a word in the pack's letters, one character to a tile, the way banner printed it: full tiles '#', cut ones / and \
+function asciiBanner(text, x, y, fg, o = {}) {
+  let cx = x;
+  for (const ch of text) {
+    if (ch === ' ') { cx += o.space || 3; continue; }
+    const g = LGF[ch] || LGF[ch.toUpperCase()];
+    if (!g) { cx += 3; continue; }
+    const rows = g.split('|');
+    rows.forEach((r, j) => { for (let i = 0; i < r.length; i++) {
+      const t = r[i];
+      if (t === '.') continue;
+      const c = t === '#' ? (o.fill || '#') : (t === '◢' || t === '◤') ? '/' : '\\';
+      put(cx + i, y + j, c, typeof fg === 'function' ? fg(cx + i, y + j, t) : fg, o.bg == null ? K0 : o.bg);
+    } });
+    cx += rows[0].length + (o.gap == null ? 1 : o.gap);
+  }
+  return cx;
+}
+function asciiBannerWidth(text, o = {}) { let w = 0, n = 0; for (const ch of text) { if (ch === ' ') { w += o.space || 3; continue; } const g = LGF[ch] || LGF[ch.toUpperCase()]; w += g ? g.split('|')[0].length + (o.gap == null ? 1 : o.gap) : 3; n++; } return w - (n ? (o.gap == null ? 1 : o.gap) : 0); }
+// lines of ink at angle a (radians) every sp pixels, as thick as the tone wants
+function hatch(px, py, tone, a, sp, off = 0) {
+  if (tone <= 0.02) return 0;
+  const d = px * Math.sin(a) - py * Math.cos(a) + off, f = Math.abs(fract(d / sp) - 0.5) * 2;   // 0 on a line, 1 between
+  return f < tone ? 1 : 0;
+}
+
+// strokes of light: each sample takes its distance to the nearest stroke; the core is w wide, the glow falls off over gr
+function aStrokes(segs, o) {
+  if (!segs.length) return;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const q of segs) { x0 = Math.min(x0, q[0], q[2]); x1 = Math.max(x1, q[0], q[2]); y0 = Math.min(y0, q[1], q[3]); y1 = Math.max(y1, q[1], q[3]); }
+  const w = o.w || 4, gr = o.gr || 0, m = w / 2 + gr + 6;
+  aRegion(x0 - m, y0 - m, x1 + m, y1 + m, (px, py, k) => {
+    let best = 1e12, bx = 0, by = 1, bq = null;
+    for (const q of segs) {
+      const ex = q[2] - q[0], ey = q[3] - q[1], wx = px - q[0], wy = py - q[1];
+      const h = clamp01((wx * ex + wy * ey) / (ex * ex + ey * ey || 1e-6)), dx = wx - ex * h, dy = wy - ey * h, dd = dx * dx + dy * dy;
+      if (dd < best) { best = dd; bx = dx; by = dy; bq = q; }
+    }
+    const L = Math.sqrt(best) || 1e-6, d = L - w / 2;
+    if (gr && d > 0 && d < gr) { const f = 1 - d / gr; aAdd(k, bq[4] || o.glow, (o.gk == null ? 0.6 : o.gk) * f * f); }
+    if (d < 3) aMix(k, bq[5] || o.core, aCovN(d, bx / L, by / L));
+  });
+}
+
+// ---------------------------------------------------------------- the demo effects
+// fire: heat rising from a bed of coals, cooling as it goes, a step every 1/35 s whatever the frame rate
+function fireNew(w = 160, h = 56, seed = 7) { return { w, h, heat: new Float32Array(w * h), t: -1, r: lcg(seed) }; }
+function fireRun(F, t, o = {}) {
+  if (F.t < 0) F.t = t - 1000;
+  let steps = 0;
+  while (F.t < t && steps < 60) { F.t += 1000 / 35; steps++; fireStep(F, o); }
+  if (F.t < t) F.t = t;
+}
+// the other fire, the way Doom drew it: every cell takes the heat of one below it, a little to one side, a little cooler
+function fireStepDoom(F, o) {
+  const { w, h, heat } = F, r = F.r, decay = o.decay || 0.05;
+  for (let x = 0; x < w; x++) heat[(h - 1) * w + x] = o.bed ? o.bed(x) : 1;
+  for (let y = 0; y < h - 1; y++) for (let x = 0; x < w; x++) {
+    const rn = Math.floor(r() * 4), dst = y * w + Math.min(w - 1, Math.max(0, x - rn + 1));
+    heat[dst] = Math.max(0, heat[(y + 1) * w + x] - (rn & 1) * decay * (0.5 + r()));
+  }
+}
+function fireStep(F, o) {
+  if (o.doom) return fireStepDoom(F, o);
+  const { w, h, heat } = F, r = F.r, cool = o.cool == null ? 0.018 : o.cool;
+  for (let x = 0; x < w; x++) {
+    const hot = o.bed ? o.bed(x) : 1;
+    heat[(h - 1) * w + x] = r() < 0.55 ? hot * (0.75 + r() * 0.5) : hot * r() * 0.3;
+    heat[(h - 2) * w + x] = Math.max(heat[(h - 2) * w + x], heat[(h - 1) * w + x] * 0.9);
+  }
+  for (let y = 0; y < h - 2; y++) for (let x = 0; x < w; x++) {
+    const xl = x > 0 ? x - 1 : x, xr = x < w - 1 ? x + 1 : x;
+    const s = heat[(y + 1) * w + xl] + heat[(y + 1) * w + x] + heat[(y + 1) * w + xr] + heat[(y + 2) * w + x];
+    heat[y * w + x] = Math.max(0, s / 4.04 - cool * (0.6 + r() * 0.8));
+  }
+}
+const FIRE_STOPS = [[0, [0, 0, 0]], [0.18, [90, 0, 0]], [0.36, [190, 20, 0]], [0.55, [250, 90, 10]], [0.75, [255, 200, 40]], [0.92, [255, 255, 170]], [1.1, [255, 255, 255]]];
+// the heat as light: row 0 of the fire at picture row y0 (in samples), each fire row one sample
+function fireDraw(F, o = {}) {
+  const stops = o.stops || FIRE_STOPS, y0 = o.y0 || 0, gain = o.gain || 1.25;
+  for (let j = o.jmin || 0; j < AFH; j++) {
+    const fy = j - y0 + (F.h - AFH);
+    if (fy < 0 || fy >= F.h) continue;
+    for (let i = 0; i < AFW; i++) {
+      const v = F.heat[fy * F.w + Math.floor(i * F.w / AFW)] * gain;
+      if (v < 0.04) continue;
+      const k = (j * AFW + i) * 3;
+      if (o.add) aAdd(k, ramp(stops, v), 1); else aMix(k, ramp(stops, v), clamp01(v * 5));
+    }
+  }
+}
+// plasma: four waves summed, read off a palette that goes round
+function aPlasma(t, stops, o = {}) {
+  const s = o.speed || 1, z = o.zoom || 1;
+  aEach((px, py, k) => {
+    const x = px / z, y = py / z, T = t / 1000 * s;
+    const v = Math.sin(x * 0.021 + T) + Math.sin(y * 0.034 - T * 1.3) + Math.sin((x + y) * 0.013 + T * 0.7) + Math.sin(Math.hypot(x - 320 - Math.sin(T * 0.6) * 160, y - 200) * 0.03 - T * 1.7);
+    const c = ramp(stops, fract(v / 8 + 0.5 + T * 0.06));
+    if (o.a != null) aMix(k, c, o.a); else { AF[k] = c[0]; AF[k + 1] = c[1]; AF[k + 2] = c[2]; }
+  });
+}
+// a tunnel: every sample looks down a tube; tex(u, v, depth) -> colour
+function aTunnel(t, tex, o = {}) {
+  const cx = o.cx == null ? 320 : o.cx, cy = o.cy == null ? 200 : o.cy;
+  aEach((px, py, k) => {
+    const dx = px - cx, dy = (py - cy) * 1.15, r = Math.hypot(dx, dy) + 1e-3;
+    const u = Math.atan2(dy, dx) / Math.PI, v = (o.depth || 300) / r;
+    const fog = Math.pow(clamp01((r - 6) / (o.fog || 110)), 0.8);
+    const c = tex(u, v, t, r);
+    AF[k] = c[0] * fog; AF[k + 1] = c[1] * fog; AF[k + 2] = c[2] * fog;
+  });
+}
+// raster bars, each a band of colour lit from its centre out
+function aCopper(bars) {
+  for (let j = 0; j < AFH; j++) {
+    const py = j * 8 + 4;
+    for (const b of bars) {
+      const d = Math.abs(py - b.y) / b.h;
+      if (d >= 1) continue;
+      const c = ramp(b.stops, d);
+      for (let i = 0, k = j * AFW * 3; i < AFW; i++, k += 3) aMix(k, c, b.a == null ? 1 : b.a);
+    }
+  }
+}
+// stars coming on toward the glass
+function starsNew(n = 140, seed = 3) { const r = lcg(seed), s = []; for (let i = 0; i < n; i++) s.push([r() * 2 - 1, r() * 2 - 1, r()]); return s; }
+function aStars(stars, t, o = {}) {
+  const sp = o.speed || 0.35, cx = o.cx == null ? 320 : o.cx, cy = o.cy == null ? 200 : o.cy;
+  for (const s of stars) {
+    const z = fract(s[2] - t / 1000 * sp) + 0.02, px = cx + s[0] / z * 160, py = cy + s[1] / z * 100;
+    if (px < 0 || px >= 640 || py < 0 || py >= 400) continue;
+    const i = Math.floor(px / 4), j = Math.floor(py / 8), k = (j * AFW + i) * 3, b = clamp01((1 - z) * 1.4);
+    aAdd(k, o.c || [255, 255, 255], b * b * 1.6);
+  }
+}
+
+// ---- 29_cnc.js
+// SOUL.ZIP, the pack itself. An art pack the way iCE and ACiD put them out in 1992: a loader, then the pieces one after
+// another, each sent down the line at modem speed and signed in the corner by whoever drew it. The Latter-Day Priors are
+// a cult that believes a prior is held, not chosen, so the pack is credited the way the NFO says: AUGUSTINE did the
+// hatching, CALVIN the five points in colour, BAYES the prior held fixed, MOLINA the kerning, the REMNANT everything else,
+// and ELIHU uploaded it to THE ASH HEAP after the old men were done.
+
+const CNC_PIECES = [];
+// the artist's tag in the corner, as every piece had one
+function cncTag(s, fg = DGR) { aText(79 - s.length, 24, s, fg); }
+const CNC_STARS = (() => { const r = lcg(7), a = []; for (let i = 0; i < 110; i++) a.push([r() * 640, r() * 400, r()]); return a; })();
+// a glint: a star of light on a highlight, coming and going
+function cncGlint(x, y, t, ph, big) {
+  const k = (Math.sin(t / 210 + ph * 6.3) + 1) / 2;
+  if (k < 0.3 || x < 0 || x >= W || y < 0 || y >= H) return;
+  const bg = aCellNear(x, y);
+  put(x, y, k > 0.85 && big ? '☼' : k > 0.6 ? '*' : '+', k > 0.7 ? WHT : LCY, bg);
+}
+
+// CNC-LOGO.ANS, the remnant: the name of the cult in chrome, the night behind it
+CNC_PIECES.push({
+  file: 'CNC-LOGO.ANS', beats: 3, by: 'the remnant',
+  draw(t) {
+    aFill(AP[K0]);
+    for (const [x, y, p] of CNC_STARS) { const k = 0.5 + 0.5 * Math.sin(t / 300 + p * 40); if (p < 0.5 && (y < 30 || y > 230)) aGlow(x, y, 6, [120, 140, 255], k * 0.9); }
+    const L = aLogoBuild('cNc', { tw: 30, th: 24, gap: 1, round: 6 });
+    const x = 320 - L.w / 2, y = 34, sh = (t / 5) % 1000 - 250;
+    const chrome = MAT.chrome({ bw: 10 });
+    aLogo(L, { x, y, bold: 3,
+      mat: (u, v, d, nx, ny, lx, ly) => { const c = chrome(u, v, d, nx, ny); const s = Math.abs(lx + ly * 0.7 - sh); return s < 22 ? mixc(c, AP[WHT], (1 - s / 22) * 0.9) : c; },
+      outline: AP[K0], ow: 4, extrude: { dx: 3, dy: 4, n: 5, col: (f) => AP[f < 0.4 ? LBL : BLU] } });
+    aQuant();
+    cncGlint(17, 6, t, 0.1, 1); cncGlint(40, 3, t, 0.55, 1); cncGlint(61, 11, t, 0.8, 0); cncGlint(27, 13, t, 0.3, 0);
+    const title = 'C U L T   O F   T H E   N U L L   C O W', TC = [BLU, LBL, LCY, WHT, LCY, LBL];
+    const tx = Math.floor((W - title.length) / 2);
+    for (let i = 0; i < title.length; i++) if (title[i] !== ' ') put(tx + i, 16, title[i], TC[Math.floor(i / 2 + t / 90) % TC.length], K0);
+    aCenter(17, '────────────  the Latter-Day Priors  ────────────', BLU);
+    aCenter(19, 'S O U L . Z I P', YEL);
+    aCenter(20, 'an art pack  ·  october 1992  ·  ten files and the soul', LGR);
+    aCenter(22, 'your prior was set before you were born.', DGR);
+    cncTag('the remnant/cNc');
+  },
+});
+
+// SOUL-ZIP.ANS, elihu: the name of the pack in steel with a fire coming up through it, and what PKUNZIP says is inside
+const SZ_FIRE = fireNew(160, 64, 11);
+CNC_PIECES.push({
+  file: 'SOUL-ZIP.ANS', beats: 3, by: 'elihu',
+  draw(t) {
+    aFill(AP[K0]);
+    fireRun(SZ_FIRE, t, { doom: true, decay: 0.052, bed: (x) => 0.86 + 0.14 * Math.sin(x * 0.09 + t / 400) });
+    fireDraw(SZ_FIRE, { y0: 0, gain: 1.0, jmin: 22 });
+    const L = aLogoBuild('SOUL.ZIP', { tw: 15, th: 19, gap: 1, round: 5 });
+    aLogo(L, { x: 320 - L.w / 2, y: 196, bold: 3,
+      mat: MAT.metal(AP[WHT], [170, 175, 190], [70, 70, 85], { bw: 7, lit: AP[WHT], dark: AP[K0] }),
+      outline: AP[K0], ow: 6, extrude: { dx: 2, dy: 3, n: 4, col: (f) => AP[f < 0.5 ? DGR : K0] } });
+    aQuant();
+    const L1 = ['PKUNZIP (R)    FAST!    Extract Utility    Version 1.1    03-15-90',
+      'Copr. 1989-1990 PKWARE Inc.  All Rights Reserved.  PKUNZIP/h for help', '', '■ 80286 CPU detected.', '',
+      'Searching ZIP: SOUL.ZIP', '',
+      ' Length  Method   Size  Ratio   Date    Time    CRC-32   Name',
+      ' ------  ------   ----  -----   ----    ----    ------   ----',
+      '  10240  Imploded  3102  70%  10-02-92  03:09  6c1a99f2  CNC-LOGO.ANS',
+      '   4096  Stored    4096   0%  01-01-80  00:00  00000000  SOUL.DAT'];
+    L1.forEach((l, i) => put(6, i, l, i === 10 ? YEL : i < 2 ? DGR : LGR, K0));
+    put(39, 11, 'the soul does not compress.', LRD, aCellNear(39, 11));
+    cncTag('elihu/cNc', YEL);
+  },
+});
+
+// CIVITAS.ASC, augustine: the city of God on its hill under the moon, engraved, in nothing but the characters on the keys
+const CIV = { art: null, L: null };
+const CIV_PARTS = [  // x0, x1, top of wall, foot, roof height, kind
+  [196, 444, 214, 262, 0, 'wall'], [208, 236, 150, 214, 26, 'tower'], [404, 432, 150, 214, 26, 'tower'],
+  [250, 278, 118, 214, 30, 'tower'], [362, 390, 118, 214, 30, 'tower'], [284, 356, 142, 214, 36, 'nave'], [308, 332, 70, 142, 64, 'spire']];
+function civRegion(px, py) {
+  const md = Math.hypot(px - 112, (py - 82) * 1.05);
+  if (md < 62 && Math.hypot(px - 150, (py - 74) * 1.05) > 50) return 3;
+  for (let i = CIV_PARTS.length - 1; i >= 0; i--) {
+    const [x0, x1, y0, y1, roof, kind] = CIV_PARTS[i], mid = (x0 + x1) / 2;
+    if (px < x0 || px >= x1 || py >= y1) continue;
+    const top = y0 - roof * (1 - Math.abs(px - mid) / ((x1 - x0) / 2));
+    if (kind === 'wall' && py < y0 + 8 && py >= y0 && Math.floor((px - x0) / 12) % 2) continue;    // battlements
+    if (py < top) continue;
+    if (py < y0) return px < mid ? 7 : 8;
+    if (kind === 'wall' && px > 304 && px < 336 && py > 228 - Math.max(0, 6 - Math.abs(px - 320) / 2.6)) return 10;   // the gate
+    if (kind !== 'wall' && kind !== 'spire' && (py - y0) % 28 > 8 && (py - y0) % 28 < 20 && Math.abs(px - mid) < 4) return 9;
+    if (kind === 'nave' && (py - y0) % 28 > 8 && (py - y0) % 28 < 20 && (Math.abs(px - mid + 20) < 3 || Math.abs(px - mid - 20) < 3)) return 9;
+    return px < mid - (kind === 'wall' ? 30 : 0) ? 5 : 6;
+  }
+  const hill = 262 + Math.pow(Math.abs(px - 320) / 320, 1.7) * 120 - Math.sin(px / 47) * 4;
+  if (py > hill) return 4;
+  const ra = Math.atan2(py - 150, px - 320), rd = Math.hypot(px - 320, py - 150);
+  if (rd > 150 && md > 62 && Math.abs(fract(ra / Math.PI * 9 + 0.5) - 0.5) < 0.07) return px < 260 ? 12 : px > 380 ? 13 : 14;
+  return 1;
+}
+const CIV_REG = {
+  1: { z: 0, dir: 'h', ink: [BLU, BLU, LBL], edge: false, tone: (x, y) => { const md = Math.hypot(x - 112, y - 82); return 0.1 + 0.18 * clamp01(1 - y / 260) + (md < 160 && md > 70 && Math.abs(fract(md / 22) - 0.5) < 0.14 ? 0.32 : 0); } },
+  12: { z: 1, dir: 'd', ink: [BLU, LBL, LBL], edge: false, tone: () => 0.45 }, 13: { z: 1, dir: 'u', ink: [BLU, LBL, LBL], edge: false, tone: () => 0.45 },
+  14: { z: 1, dir: 'v', ink: [BLU, LBL, LBL], edge: false, tone: () => 0.45 },
+  4: { z: 2, dir: 'u', ink: [DGR, DGR, LGR], tone: (x, y) => 0.22 + clamp01((y - 262) / 260) * 0.6 },
+  5: { z: 3, dir: 'v', ink: [DGR, LGR, WHT], tone: () => 0.8 }, 6: { z: 3, dir: 'x', ink: [DGR, DGR, LGR], tone: () => 0.32 },
+  7: { z: 3, dir: 'd', ink: [DGR, LGR, WHT], tone: () => 0.75 }, 8: { z: 3, dir: 'u', ink: [DGR, DGR, LGR], tone: () => 0.35 },
+  9: { z: 4, dir: 'n', ink: [K0, K0, K0], edge: false }, 10: { z: 4, dir: 's', ink: [BRN, YEL, YEL], tone: () => 0.75 },
+  3: { z: 5, dir: 's', ink: [BRN, YEL, WHT], tone: (x, y) => 0.45 + 0.5 * clamp01((Math.hypot(x - 150, (y - 74) * 1.05) - 50) / 40) },
+  11: { z: 9, dir: 's', ink: [LCY, LCY, WHT], edge: false, tone: () => 0.99 },
+};
+CNC_PIECES.push({
+  file: 'CIVITAS.ASC', beats: 3, by: 'augustine',
+  draw(t) {
+    if (!CIV.art) CIV.art = aEngrave(civRegion, { regions: CIV_REG });
+    const A = CIV.art, B = TGT;
+    for (let k = 0; k < N; k++) { B.ch[k] = A.ch[k]; B.fg[k] = A.fg[k]; B.bg[k] = K0; B.bl[k] = 0; }
+    // the lit windows, coming and going, and the cross
+    [[27, 9], [33, 10], [46, 10], [52, 9], [37, 11], [43, 11], [38, 13], [42, 13], [30, 12], [49, 12]].forEach(([x, y], i) => {
+      if ((Math.floor(t / 520) + i * 5) % 11) put(x, y, '■', YEL, K0); else put(x, y, '·', BRN, K0);
+    });
+    put(40, 3, '┼', YEL, K0);
+    for (const [x, y, ph] of [[3, 1, 0.1], [30, 2, 0.5], [58, 1, 0.8], [71, 4, 0.3], [64, 9, 0.65], [5, 13, 0.9], [77, 12, 0.2]]) put(x, y, Math.sin(t / 300 + ph * 9) > 0.3 ? '*' : '·', Math.sin(t / 300 + ph * 9) > 0.3 ? WHT : LBL, K0);
+    const bw = asciiBannerWidth('CIVITAS DEI'), bx = Math.floor((W - bw) / 2);
+    fill(bx - 2, 16, bw + 4, 7, ' ', LGR, K0);
+    asciiBanner('CIVITAS DEI', bx, 16, (x, y, tt) => (tt === '#' ? (y < 18 ? WHT : y < 20 ? LCY : LBL) : LGR));
+    center(23, ' two loves have made two cities ', LGR, K0);
+    put(1, 24, 'predestination, hatching', DGR, K0);
+    put(79 - 'augustine/cNc'.length, 24, 'augustine/cNc', DGR, K0);
+  },
+});
+
+// TULIP.ICE, calvin: the five points, in colour. A plate from a seed catalogue, on the bright backgrounds iCE allowed.
+const TULIP_POINTS = [['T', 'otal depravity', LRD], ['U', 'nconditional election', YEL], ['L', 'imited atonement', LGN], ['I', 'rresistible grace', LCY], ['P', 'erseverance of the saints', LMG]];
+const TULIP_LOGOS = {};
+function petalAt(px, py, cx, cy, rx, ry, tilt) {
+  const dx = px - cx, dy = py - cy, c = Math.cos(tilt), s = Math.sin(tilt);
+  const x = dx * c + dy * s, y = -dx * s + dy * c, v = y / ry;
+  if (v < -1 || v > 1) return null;
+  const w = v > 0 ? Math.sqrt(1 - v * v) : Math.pow(1 - Math.pow(-v, 1.7), 0.8);
+  const u = x / (rx * w + 1e-6);
+  return Math.abs(u) > 1 ? null : [u, v];
+}
+function leafAt(px, py, x0, y0, x1, y1, cx, cy, wd) {
+  // a leaf along a curve from its foot to its tip: [s along it, side]
+  let best = 1e9, bs = 0, side = 0;
+  for (let i = 0; i <= 24; i++) {
+    const s = i / 24, a = (1 - s) * (1 - s), b = 2 * (1 - s) * s, c = s * s;
+    const qx = a * x0 + b * cx + c * x1, qy = a * y0 + b * cy + c * y1, d = Math.hypot(px - qx, py - qy);
+    if (d < best) { best = d; bs = s; side = (px - qx) * (y1 - y0) - (py - qy) * (x1 - x0); }
+  }
+  const w = Math.sin(Math.pow(bs, 0.8) * Math.PI) * wd;
+  return best < w ? [bs, side] : null;
+}
+CNC_PIECES.push({
+  file: 'TULIP.ICE', beats: 3, by: 'calvin',
+  draw(t) {
+    aFill(AP[WHT]);
+    // the leaves, the stem
+    aRegion(20, 180, 330, 400, (px, py, k) => {
+      for (const [x1, y1, cx, cy] of [[60, 222, 70, 330], [292, 250, 270, 340]]) {
+        const r = leafAt(px, py, 172, 398, x1, y1, cx, cy, 30);
+        if (r) aMix(k, r[1] > 0 === x1 < 172 ? AP[LGN] : AP[GRN], 1);
+      }
+    });
+    aRect(168, 236, 182, 398, AP[GRN]); aRect(168, 236, 173, 398, AP[LGN]);
+    // the cup: two petals behind, one in front, cupped and lit from the left
+    const sway = Math.sin(t / 900) * 3;
+    aDisc(175 + sway, 92, 50, AP[MAG], 1, 26);
+    aDisc(175 + sway, 96, 36, [90, 0, 60], 1, 16);
+    aRegion(80, 30, 280, 250, (px, py, k) => {
+      let col = null;
+      for (const [cx, cy, rx, ry, tilt, front] of [[146 + sway, 150, 50, 96, -0.2, 0], [204 + sway, 150, 50, 96, 0.2, 0], [175 + sway, 162, 54, 92, 0, 1]]) {
+        const r = petalAt(px, py, cx, cy, rx, ry, tilt);
+        if (!r) continue;
+        const [u, v] = r, lit = -u * 0.5 - v * 0.18 + (front ? 0.12 : -0.12) + (1 - u * u) * 0.18;
+        col = lit > 0.5 ? AP[WHT] : lit > 0.3 ? AP[LMG] : lit > 0.06 ? AP[LRD] : lit > -0.25 ? AP[RED] : AP[MAG];
+        if (front && Math.abs(u + 0.5) < 0.05 && v > -0.55 && v < 0.4) col = AP[LMG];
+        if (Math.abs(u) > 0.93) col = AP[MAG];
+      }
+      if (col) aMix(k, col, 1);
+    });
+    // the five letters, each in its colour, lit in turn
+    const on = Math.floor(t / 320) % 6;
+    TULIP_POINTS.forEach(([L, rest, col], i) => {
+      const lit = i === on || on === 5;
+      if (!TULIP_LOGOS[L]) TULIP_LOGOS[L] = aLogoBuild(L, { tw: 8, th: 8, round: 2 });
+      const G = TULIP_LOGOS[L];
+      aLogo(G, { x: 356 + (40 - G.w) / 2, y: 14 + i * 74, bold: 2, mat: (u, v) => AP[lit ? (v < 0.35 ? WHT : col) : col], outline: AP[K0], ow: 3,
+        shadow: { dx: 4, dy: 5, c: AP[LGR] } });
+    });
+    aQuant();
+    for (let x = 1; x < 79; x++) { put(x, 0, '═', DGR, WHT); put(x, 24, '═', DGR, WHT); }
+    for (let y = 1; y < 24; y++) { put(0, y, '║', DGR, WHT); put(79, y, '║', DGR, WHT); }
+    put(0, 0, '╔', DGR, WHT); put(79, 0, '╗', DGR, WHT); put(0, 24, '╚', DGR, WHT); put(79, 24, '╝', DGR, WHT);
+    TULIP_POINTS.forEach(([L, rest, col], i) => {
+      const lit = i === on || on === 5, y = Math.round((14 + i * 74 + 36) / 16);
+      put(52, y, rest, lit ? K0 : DGR, WHT);
+    });
+    put(3, 22, 'Pl. V.   TULIPA  \'GENEVA\'', K0, WHT);
+    put(3, 23, 'the five points, in colour', DGR, WHT);
+    put(79 - 15, 24, ' calvin/cNc ', DGR, WHT);
+  },
+});
+
+// BAYES.ANS, bayes: the theorem in neon on a brick wall, and the prior under it in another colour, held fixed
+const NEON = {
+  P: [[[0, 6], [0, 0], [2.4, 0], [3.4, 0.8], [3.4, 2.2], [2.4, 3], [0, 3]]],
+  H: [[[0, 0], [0, 6]], [[3.4, 0], [3.4, 6]], [[0, 3], [3.4, 3]]],
+  E: [[[3.4, 0], [0, 0], [0, 6], [3.4, 6]], [[0, 3], [2.6, 3]]],
+  '|': [[[1, -0.6], [1, 6.6]]], '(': [[[2, -0.6], [0.9, 0.8], [0.5, 3], [0.9, 5.2], [2, 6.6]]], ')': [[[0, -0.6], [1.1, 0.8], [1.5, 3], [1.1, 5.2], [0, 6.6]]],
+  '=': [[[0, 2], [3, 2]], [[0, 4], [3, 4]]], '1': [[[0.6, 1.2], [2, 0], [2, 6]]], '/': [[[3, -0.4], [0, 6.4]]],
+  '·': [[[0.85, 3], [1.15, 3]]], '∝': [[[3.6, 1.6], [2.6, 1.6], [1.6, 3], [0.9, 4.2], [0.3, 4.2], [0, 3], [0.3, 1.8], [0.9, 1.8], [1.6, 3], [2.6, 4.4], [3.6, 4.4]]],
+};
+const NEON_W = { P: 4.4, H: 4.4, E: 4.2, '|': 2, '(': 2.6, ')': 2.6, '=': 4, '1': 3, '/': 3.8, '·': 2, ' ': 2.4, '∝': 4.6 };
+function neonSegs(s, x, y, sc, core, glow, t, seed, flick = 0) {
+  const segs = [];
+  let cx = x;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i], st = NEON[ch], dead = flick && ahash(seed * 31 + i, Math.floor(t / 80)) < flick;
+    if (st) for (const pl of st) for (let j = 1; j < pl.length; j++)
+      segs.push([cx + pl[j - 1][0] * sc, y + pl[j - 1][1] * sc, cx + pl[j][0] * sc, y + pl[j][1] * sc, dead ? [0, 0, 0] : glow, dead ? [90, 50, 70] : core]);
+    cx += (NEON_W[ch] || 3) * sc;
+  }
+  return segs;
+}
+function neonWidth(s, sc) { let w = 0; for (const ch of s) w += (NEON_W[ch] || 3) * sc; return w; }
+CNC_PIECES.push({
+  file: 'BAYES.ANS', beats: 2, by: 'bayes',
+  draw(t) {
+    // the bricks, dark, each its own red, the mortar between
+    aEach((px, py, k) => {
+      const row = Math.floor(py / 24), bx = (px + (row & 1) * 30) / 60, col = Math.floor(bx), fx = fract(bx), fy = fract(py / 24);
+      const mortar = fy < 0.18 || fx < 0.06, v = ahash(col, row);
+      const c = mortar ? [8, 8, 10] : v < 0.33 ? [60, 14, 10] : v < 0.66 ? [52, 22, 8] : [44, 10, 16];
+      AF[k] = c[0]; AF[k + 1] = c[1]; AF[k + 2] = c[2];
+    });
+    const s1 = 'P(H|E)', sc1 = 13, w1 = neonWidth(s1, sc1);
+    const n1 = neonSegs(s1, 320 - w1 / 2, 28, sc1, [255, 90, 255], [210, 0, 160], t, 3, 0.05);
+    aStrokes(n1, { w: 10, gr: 11, gk: 0.75 }); aStrokes(n1.map(q => [q[0], q[1], q[2], q[3], null, q[5][0] > 100 ? [255, 235, 255] : q[5]]), { w: 3 });
+    const s2 = '= P(H) = 1', sc2 = 15, w2 = neonWidth(s2, sc2);
+    const n2 = neonSegs(s2, 320 - w2 / 2, 166, sc2, [80, 255, 255], [0, 140, 220], t, 7, 0);
+    aStrokes(n2, { w: 11, gr: 12, gk: 0.8 }); aStrokes(n2.map(q => [q[0], q[1], q[2], q[3], null, [235, 255, 255]]), { w: 3 });
+    aQuant();
+    aCenter(22, ' the prior, held fixed.  the evidence is received and recorded. ', LCY, { bg: K0 });
+    aCenter(23, ' it does not update it. ', DGR, { bg: K0 });
+    cncTag('bayes/cNc', LMG);
+  },
+});
+
+// KERNING.ANS, molina: a specimen sheet. Middle knowledge is what every free creature would do in every circumstance,
+// known in advance; a kerning table is what every letter would do beside every other one, known before it is set.
+CNC_PIECES.push({
+  file: 'KERNING.ANS', beats: 2, by: 'molina',
+  draw(t) {
+    aFill(AP[WHT]);
+    const kern = 0.5 + 0.5 * Math.sin(t / 650), base = 300, capT = 70, ax = 120, vx = 300 - kern * 70;
+    const A = [ax - 2, base, ax + 74, capT, ax + 118, capT, ax + 194, base, ax + 140, base, ax + 124, base - 52, ax + 66, base - 52, ax + 50, base];
+    const Ah = [ax + 76, base - 98, ax + 96, capT + 48, ax + 112, base - 98];
+    const V = [vx, capT, vx + 56, capT, vx + 98, base - 74, vx + 140, capT, vx + 196, capT, vx + 124, base, vx + 72, base];
+    aPoly(A, AP[K0]); aPoly(Ah, AP[WHT]); aPoly(V, AP[K0]);
+    aQuant();
+    for (let x = 2; x < 78; x++) for (const y of [4, 18]) if (TGT.ch[y * W + x] === 0xDB && TGT.fg[y * W + x] === WHT) put(x, y, '·', LGR, WHT);
+    // the sidebearings, ruled in red over it, and the measure between them
+    const aR = Math.round((ax + 196) / 8), vL = Math.round(vx / 8);
+    for (let y = 3; y < 21; y++) { put(aR, y, y % 3 ? '│' : ' ', RED, aCellNear(aR, y)); put(vL, y, y % 3 ? '│' : ' ', LRD, aCellNear(vL, y)); }
+    const a = Math.min(aR, vL), b = Math.max(aR, vL);
+    if (b - a > 1) { put(a, 20, '◄', RED, WHT); for (let x = a + 1; x < b; x++) put(x, 20, '─', RED, WHT); put(b, 20, '►', RED, WHT); }
+    const lab = ' ' + Math.round(-kern * 70 / 1.6) + ' units ';
+    put(Math.round((a + b) / 2 - lab.length / 2), 21, lab, RED, WHT);
+    put(4, 1, 'MOLINA GROTESK', K0, WHT); put(4, 2, 'specimen  ·  heavy  ·  144 point', DGR, WHT);
+    put(56, 1, 'the Latter-Day Priors', DGR, WHT); put(56, 2, 'type foundry, Uz', DGR, WHT);
+    put(1, 19, 'baseline', DGR, WHT); put(1, 3, 'cap height', DGR, WHT);
+    put(54, 7, 'every pair, known', K0, WHT); put(54, 8, 'before it was set.', K0, WHT);
+    put(54, 10, 'A beside V is not', DGR, WHT); put(54, 11, 'what A would be', DGR, WHT); put(54, 12, 'beside H.', DGR, WHT);
+    put(54, 14, 'the kerning table', DGR, WHT); put(54, 15, 'is middle knowledge.', DGR, WHT);
+    put(4, 23, 'AV  Ta  Wo  Yo  LT  PA  AW  To  Va  Ye  P.  T,', K0, WHT); put(56, 23, '18 / 24 / 36 / 144', DGR, WHT);
+    put(79 - 11, 24, 'molina/cNc', DGR, WHT);
+  },
+});
+
+// NULLCOW.ANS, the remnant: the calf, molten, turning on its plinth, the glory behind it and over its head nothing
+const CALF = { S: null };
+function calfSDF(x, y, z) {
+  const az = Math.abs(z);
+  let d = sdEll(x, y - 1.0, z, 0.74, 0.33, 0.29);
+  d = smin(d, sdEll(x - 0.48, y - 1.03, z, 0.38, 0.4, 0.32), 0.22);
+  d = smin(d, sdEll(x + 0.5, y - 1.04, z, 0.36, 0.37, 0.31), 0.22);
+  d = smin(d, sdEll(x - 0.82, y - 0.92, z, 0.14, 0.16, 0.09), 0.12);                                // the dewlap
+  d = smin(d, sdCap(x, y, z, 0.7, 1.16, 0, 1.04, 1.44, 0, 0.23, 0.17), 0.12);                       // the neck
+  d = smin(d, sdCap(x, y, z, 1.06, 1.52, 0, 1.33, 1.28, 0, 0.18, 0.13), 0.08);                      // the face, sloping down
+  d = smin(d, sdEll(x - 1.36, y - 1.24, z, 0.13, 0.11, 0.14), 0.05);                                // the muzzle
+  d = smin(d, sdCap(x, y, az, 1.04, 1.55, 0.12, 0.99, 1.52, 0.34, 0.055, 0.03), 0.04);              // the ears
+  d = Math.min(d, sdCap(x, y, az, 1.1, 1.62, 0.09, 1.05, 1.8, 0.22, 0.05, 0.035));                  // the horns
+  d = Math.min(d, sdCap(x, y, az, 1.05, 1.8, 0.22, 1.15, 1.9, 0.17, 0.035, 0.016));
+  d = smin(d, sdCap(x, y, az, 0.52, 0.86, 0.16, 0.56, 0.46, 0.16, 0.11, 0.075), 0.08);             // forelegs
+  d = smin(d, sdCap(x, y, az, 0.56, 0.46, 0.16, 0.54, 0.05, 0.16, 0.068, 0.06), 0.05);
+  d = smin(d, sdCap(x, y, az, -0.46, 0.92, 0.16, -0.56, 0.5, 0.16, 0.13, 0.075), 0.08);            // hind legs, and the hock
+  d = smin(d, sdCap(x, y, az, -0.56, 0.5, 0.16, -0.5, 0.05, 0.16, 0.065, 0.06), 0.05);
+  d = Math.min(d, sdCap(x, y, az, 0.54, 0.06, 0.16, 0.55, 0.0, 0.16, 0.075, 0.075), sdCap(x, y, az, -0.5, 0.06, 0.16, -0.5, 0.0, 0.16, 0.075, 0.075));
+  d = smin(d, sdCap(x, y, z, -0.84, 1.15, 0, -0.97, 0.52, 0, 0.035, 0.028), 0.05);                 // the tail
+  d = smin(d, sdEll(x + 0.98, y - 0.47, z, 0.055, 0.11, 0.055), 0.03);
+  return d;
+}
+CNC_PIECES.push({
+  file: 'NULLCOW.ANS', beats: 4, beatsShort: 3, by: 'the remnant',
+  draw(t) {
+    if (!CALF.S) CALF.S = aSolid(calfSDF, [-1.15, -0.05, -0.5, 1.6, 2.05, 0.5], 0.032);
+    // the glory, turning, dark: the calf must be the light in it
+    const a0 = t / 5000;
+    aEach((px, py, k) => {
+      const dx = px - 320, dy = py - 200, r = Math.hypot(dx, dy * 1.2), a = Math.atan2(dy * 1.2, dx);
+      const wedge = fract((a / (Math.PI * 2)) * 18 + a0) < 0.42, f = clamp01(1 - r / 400) * sstep(70, 230, r);
+      const c = wedge ? [170 * f, 50 * f * f, 0] : [36 * f * f, 0, 0];
+      AF[k] = c[0]; AF[k + 1] = c[1]; AF[k + 2] = c[2];
+    });
+    // the plinth, and the calf's shadow on it
+    aPoly([176, 322, 464, 322, 450, 338, 190, 338], AP[LGR]);
+    aRect(190, 338, 450, 392, AP[DGR]); aRect(190, 338, 198, 392, AP[LGR]); aRect(442, 338, 450, 392, [30, 30, 30]);
+    aRect(190, 386, 450, 394, [20, 20, 20]);
+    aDisc(320, 330, 132, [40, 30, 20], 0.9, 7);
+    // the calf
+    aSolidDraw(CALF.S, { yaw: -0.35 + t / 3000, pitch: 0.14, scale: 124, cx: 316, cy: 326, persp: 8, shade: (nx, ny, nz) => shadeGold(nx, ny, nz) });
+    // over its head, nothing: the empty set, burning
+    const g = 0.75 + 0.25 * Math.sin(t / 240);
+    aGlow(320, 50, 90, [255, 160, 30], 0.45 * g, 56);
+    aRing(320, 50, 36, 9, [255, 225, 90], 1, 30);
+    aSeg(284, 92, 356, 8, 9, [255, 250, 190]);
+    // the candles either side
+    for (const [cx, ph] of [[92, 0], [548, 2]]) {
+      aRect(cx - 8, 244, cx + 8, 394, AP[WHT]); aRect(cx + 3, 244, cx + 8, 394, AP[LGR]);
+      const fl = Math.sin(t / 70 + ph) * 2 + Math.sin(t / 37 + ph) * 1.5;
+      aGlow(cx + fl * 0.5, 222, 50, [255, 150, 30], 0.6, 56);
+      aDisc(cx + fl * 0.4, 226, 6, AP[YEL], 1, 15); aDisc(cx + fl * 0.2, 232, 3, AP[WHT], 1, 8);
+    }
+    aQuant({ pal: [K0, RED, BRN, LRD, YEL, WHT, DGR, LGR] });
+    aCenter(22, ' φ ', YEL, { bg: DGR, solid: true });
+    aCenter(24, 'the calf was always going to be gold', BRN, { bg: K0 });
+  },
+});
+
+// WINDOW.ANS, the remnant: the window over the altar, leaded and lit from behind. The rose in it is a diskette, and a skull.
+function winArch(px, py, x0, x1, spring, apex) {
+  if (px < x0 || px > x1) return false;
+  if (py >= spring) return true;
+  const hw = (x1 - x0) / 2, mid = (x0 + x1) / 2, h = spring - apex;
+  const c = (h * h - hw * hw) / (2 * hw), R = hw + c;                 // two arcs meeting at the apex
+  return Math.hypot(px - (mid - c), py - spring) <= R && Math.hypot(px - (mid + c), py - spring) <= R && py >= apex;
+}
+const WIN_ROWS = [[60, 0, 200], [110, 0, 170], [80, 0, 160], [150, 0, 120], [170, 0, 40], [200, 20, 20], [170, 0, 0]];
+CNC_PIECES.push({
+  file: 'WINDOW.ANS', beats: 4, beatsShort: 3, by: 'the remnant',
+  draw(t) {
+    const sh = t / 2200;
+    aEach((px, py, k) => {
+      let c;
+      const inWin = winArch(px, py, 112, 528, 168, 0) && py < 392;
+      if (inWin) {
+        const lan = [[140, 236], [272, 368], [404, 500]].find(([a, b]) => winArch(px, py, a, b, 262, 190));
+        if (lan && py < 388) {
+          // a lancet: panes in lead, deep blue at the top going to red at the foot
+          const u = (px - lan[0] + py * 0.5) / 24, v = (px - lan[0] - py * 0.5) / 24;
+          const lead = Math.min(fract(u), 1 - fract(u), fract(v), 1 - fract(v)) < 0.09;
+          if (lead) c = [8, 8, 8];
+          else {
+            const row = WIN_ROWS[Math.max(0, Math.min(WIN_ROWS.length - 1, Math.floor((py - 190) / 30 + (ahash(Math.floor(u), Math.floor(v)) - 0.5) * 1.2)))];
+            const lum = 0.75 + 0.3 * vnoise(px / 26 + sh, py / 30);
+            c = [Math.min(255, row[0] * lum), Math.min(255, row[1] * lum), Math.min(255, row[2] * lum)];
+          }
+        } else c = [26, 22, 24];                                       // the tracery between, in stone
+      } else {
+        const row = Math.floor(py / 26), bx = (px + (row & 1) * 22) / 44, joint = Math.min(fract(py / 26), fract(bx)) < 0.08;
+        const v = 40 + ahash(Math.floor(bx), row) * 40 + (fract(py / 26) < 0.2 ? 18 : 0);
+        c = joint ? [6, 6, 6] : [v, v, v * 1.06];
+        if (winArch(px, py, 100, 540, 168, -14) && py < 396) c = mixc(c, [90, 90, 98], 0.6);     // the moulding round it
+      }
+      AF[k] = c[0]; AF[k + 1] = c[1]; AF[k + 2] = c[2];
+    });
+    // the rose: petals of red and gold round the diskette
+    const RX = 320, RY = 104;
+    aRegion(RX - 150, 0, RX + 150, RY + 150, (px, py, k) => {
+      const r = Math.hypot(px - RX, py - RY), a = Math.atan2(py - RY, px - RX), f = fract((a / (Math.PI * 2) + 1) * 16);
+      if (r > 140 || r < 104) return;
+      const lead = Math.abs(f - 0.5) > 0.42 || r > 136 || r < 108 || Math.abs(r - 122) < 2;
+      aMix(k, lead ? [8, 8, 8] : (Math.floor((a / (Math.PI * 2) + 1) * 16) % 2 ? [230, 60, 20] : [220, 160, 20]), 1);
+    });
+    // the diskette, square, black: a label, two holes for eyes, a nose, a slot for a mouth
+    const S0 = 148, x0 = RX - S0 / 2, y0 = RY - S0 / 2;
+    aRect(x0 - 6, y0 - 6, x0 + S0 + 6, y0 + S0 + 6, [6, 6, 6]);
+    aRect(x0, y0, x0 + S0, y0 + S0, [34, 32, 36]);
+    aRect(x0, y0, x0 + S0, y0 + 4, [100, 100, 108]); aRect(x0, y0, x0 + 4, y0 + S0, [80, 80, 88]);
+    aRect(x0 + S0 - 10, y0 + 46, x0 + S0 + 6, y0 + 64, [6, 6, 6]);                                      // the write-protect notch
+    aRect(x0 + 14, y0 + 8, x0 + S0 - 14, y0 + 34, [236, 232, 214]);                                   // the label
+    const glow = 0.65 + 0.35 * Math.sin(t / 420);
+    for (const ex of [RX - 36, RX + 36]) {
+      aRing(ex, RY + 4, 27, 3, [90, 80, 64], 1, 24);
+      aDisc(ex, RY + 4, 25, [4, 2, 2], 1, 22);
+      aGlow(ex, RY + 7, 20, [255, 40, 10], glow * 2.4, 14);
+      aDisc(ex, RY + 7, 5, [255, 110, 70], glow, 5);
+    }
+    aPoly([RX, RY + 28, RX - 10, RY + 46, RX + 10, RY + 46], [4, 2, 2]);                               // the index hole, a nose
+    aRect(RX - 46, RY + 50, RX + 46, RY + 70, [80, 36, 10]);                                           // the slot, the disk in it
+    for (let x = RX - 44; x < RX + 44; x += 11) { aRect(x, RY + 50, x + 7, RY + 59, [235, 230, 205]); aRect(x + 3, RY + 61, x + 10, RY + 70, [205, 200, 175]); }
+    // the light it throws down the wall to the right, and the dust in it
+    aRegion(330, 120, 640, 400, (px, py, k) => {
+      if (winArch(px, py, 100, 540, 168, -14)) return;
+      const sx = px - (py - 160) * 0.62;
+      if (sx > 260 && sx < 520) aAdd(k, WIN_ROWS[Math.floor((sx - 260) / 38) % WIN_ROWS.length], 0.22 * (1 - clamp01((py - 160) / 300)));
+    });
+    aQuant();
+    put(36, 3, ' S O U L ', BLU, WHT);
+    for (let i = 0; i < 9; i++) { const x = 70 + Math.floor((i * 37 + t / 260) % 10), y = 12 + Math.floor((i * 23 + t / 400) % 12); if (x < 80) put(x, y, '·', YEL, aCellNear(x, y)); }
+    cncTag('the remnant/cNc', DGR);
+  },
+});
+
+// GREETS.ANS, the remnant: who is greeted, and who is not
+CNC_PIECES.push({
+  file: 'GREETS.ANS', beats: 2, by: 'the remnant',
+  draw(t) {
+    aFill(AP[K0]);
+    for (const [x, y, p] of CNC_STARS) { const k = 0.5 + 0.5 * Math.sin(t / 260 + p * 40); if (p < 0.35) aGlow(x, y, 6, [120, 140, 255], k * 0.8); }
+    const L = aLogoBuild('GREETS', { tw: 16, th: 13, round: 4 });
+    aLogo(L, { x: 320 - L.w / 2, y: 14, bold: 2, mat: MAT.chrome({ bw: 7 }), outline: AP[K0], ow: 4, extrude: { dx: 2, dy: 3, n: 4, col: () => AP[BLU] } });
+    const L2 = aLogoBuild('PELAGIUS', { tw: 13, th: 11, round: 3 });
+    aLogo(L2, { x: 320 - L2.w / 2, y: 268, bold: 2, mat: (u, v, d, nx, ny) => { const bk = bevelK(d, nx, ny, 5); return bk > 0.2 ? AP[WHT] : v < 0.5 ? AP[LGR] : [130, 130, 130]; }, outline: AP[K0], ow: 4,
+      extrude: { dx: 2, dy: 3, n: 3, col: () => AP[DGR] } });
+    const strike = clamp01(((t % 2600) - 400) / 700);
+    if (strike > 0) { const sx = 320 - L2.w / 2 - 26; aSeg(sx, 320, sx + (L2.w + 52) * strike, 300, 11, AP[LRD]); }
+    aQuant();
+    const RAIN = [LRD, YEL, LGN, LCY, LBL, LMG];
+    [['AUGUSTINE', 'the hatching'], ['CALVIN', 'the five points'], ['BAYES', 'the prior'], ['MOLINA', 'the kerning'], ['the REMNANT', 'everything else']].forEach(([n, w], i) => {
+      const y = 9 + i, x0 = 20;
+      for (let j = 0; j < n.length; j++) put(x0 + j, y, n[j], RAIN[(j + i * 2 + Math.floor(t / 100)) % RAIN.length], K0);
+      put(x0 + n.length + 1, y, '.'.repeat(20 - n.length), DGR, K0);
+      put(x0 + 22, y, w, LGR, K0);
+    });
+    aCenter(15, '·  N  O     G  R  E  E  T  S  ·', LRD, { bg: K0 });
+    aCenter(23, 'uploaded to THE ASH HEAP by ELIHU, who waited until the old men were done.', DGR, { bg: K0 });
+    cncTag('the remnant/cNc');
+  },
+});
+
+// ASHHEAP.ANS, elihu: the board where the pack lives, in ash, still smoking
+const ASH_EMBERS = (() => { const r = lcg(41), a = []; for (let i = 0; i < 30; i++) a.push([r(), r(), r()]); return a; })();
+CNC_PIECES.push({
+  file: 'ASHHEAP.ANS', beats: 3, by: 'elihu',
+  draw(t) {
+    aFill(AP[K0]);
+    aRegion(0, 0, 640, 200, (px, py, k) => {
+      const h = clamp01((200 - py) / 200);
+      let v = 0;
+      for (let i = 0; i < 6; i++) {
+        const x0 = 70 + i * 100 + Math.sin(i * 7.1) * 20, cx = x0 + Math.sin(py / 38 + t / 800 + i * 2) * (10 + h * 40) + h * h * 60 * Math.sin(i * 3.3);
+        const w = 6 + h * 30, d = (px - cx) / w;
+        v += Math.exp(-d * d) * (0.3 + 0.9 * fbm(px / 34, (py + t / 12) / 26, 2));
+      }
+      v *= h * (1.3 - h);
+      const c = v > 0.6 ? 100 : v > 0.36 ? 64 : v > 0.2 ? 36 : 0;
+      AF[k] = c; AF[k + 1] = c; AF[k + 2] = c * 1.06;
+    });
+    const L = aLogoBuild('THE ASH HEAP', { tw: 9, th: 13, round: 3 });
+    const x = 320 - L.w / 2, y = 104;
+    aLogo(L, { x, y, bold: 2,
+      mat: (u, v, d, nx, ny, lx, ly) => {
+        let c = bands([[0, WHT], [0.28, LGR], [0.6, DGR]], v, 0.06);
+        const bk = bevelK(d, nx, ny, 6); if (bk > 0.25) c = mixc(c, AP[WHT], bk); else if (bk < -0.3) c = mixc(c, AP[K0], -bk);
+        return mixc(c, [255, 80, 0], sstep(0.78, 1, v) * (0.6 + 0.4 * Math.sin(lx / 11 + t / 180)));
+      }, outline: AP[K0], ow: 5, glow: [200, 40, 0], gr: 10, gk: 0.35 });
+    aQuant();
+    for (const [a, b, c] of ASH_EMBERS) {
+      const ex = Math.floor(10 + a * 60 + Math.sin(t / 700 + c * 9) * 2), ey = Math.floor(14 - fract(t / (2400 + c * 1800) + b) * 14);
+      if (ey >= 0 && ey < 14) put(ex, ey, c > 0.6 ? '·' : '∙', ey > 9 ? YEL : ey > 4 ? LRD : RED, aCellNear(ex, ey));
+    }
+    frame(9, 15, 62, 8, 'd', DGR, K0);
+    fill(10, 16, 60, 6, ' ', LGR, K0);
+    center(16, 'POTSHERD/BBS v1.9   ·   node 1 of 1   ·   2400 baud', LGR, K0);
+    center(17, 'sysop: (unlisted)   ·   open most nights', DGR, K0);
+    center(18, 'call  555-0102', YEL, K0);
+    center(19, 'the cNc archive  ·  SOUL.ZIP  ·  LEVIATHAN (a door)', LCY, K0);
+    center(21, '"and he sat down among the ashes."   Job 2:8', DGR, K0);
+    cncTag('elihu/cNc');
+  },
+});
+
+// for building: ?art=cnc0 .. ?art=cnc9 shows one piece, running
+for (let i = 0; i < 16; i++) window['art_cnc' + i] = () => { const P = CNC_PIECES[i]; if (P) P.draw(NOW); };
+
+// ---- 30_cncview.js
+// HARROW.EXE: the pack's loader, then the pack, then the door. The loader is a demo in the way the packs came in, on the
+// one voice the machine has; the pack is shown the way the viewers showed it, each file coming down the line or wiped or
+// scrolled in on the beat; and at the end there is the door at the back, which was already open.
+
+// ---------------------------------------------------------------- the tune: A minor, round and round, a kick and a snare
+// on the same voice as the melody, the chords broken into arpeggios too fast to hear as anything but chords
+const NOTE = (n) => {
+  const m = /^([A-G])([#b]?)(\d)$/.exec(n);
+  const base = { C: -9, D: -7, E: -5, F: -4, G: -2, A: 0, B: 2 }[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0);
+  return 440 * Math.pow(2, (base + (+m[3] - 4) * 12) / 12);
+};
+const CNC_BPM = 140, CNC_BEAT = 60000 / CNC_BPM;
+const CNC_MEL = ('A5 - E6 - D6 C6 B5 . C6 - A5 - . . E5 . ' + 'F5 . A5 . C6 - D6 . C6 . A5 . . G5 A5 . ' +
+  'D6 . F6 - E6 D6 C6 . A5 - . . D6 . F6 . ' + 'E6 - D6 . B5 - G#5 . E5 . G#5 . B5 . D6 .').trim().split(/\s+/);
+const CNC_CHORDS = [['A4', 'C5', 'E5'], ['F4', 'A4', 'C5'], ['D4', 'F4', 'A4'], ['E4', 'G#4', 'B4']];
+function cncTune() {
+  if (!AU.on || !AU.ctx) return null;
+  const ctx = AU.ctx, o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = 'square'; o.frequency.value = 440; g.gain.value = 0;
+  o.connect(g); g.connect(AU.mus || AU.spk);
+  const st = 60 / CNC_BPM / 4, T = { o, g, st, t0: AU.t() + 0.06, s: 0, cur: 0, done: false };
+  o.start(T.t0 - 0.01);
+  T.pump = () => { if (T.done) return; const until = AU.t() + 0.4; while (T.t0 + T.s * st < until) { cncStep(T, T.s, T.t0 + T.s * st); T.s++; } };
+  T.pump();
+  T.anim = () => T.pump();
+  ANIM.add(T.anim);
+  return T;
+}
+function cncStep(T, s, ts) {
+  const f = T.o.frequency, gg = T.g.gain, st = T.st, m = CNC_MEL[s % 64], ch = CNC_CHORDS[Math.floor(s / 16) % 4];
+  const VM = 0.065, VA = 0.04, VD = 0.08;
+  let t = ts;
+  if (s % 8 === 0) {                          // the kick: the pitch falling away
+    f.setValueAtTime(190, t); f.exponentialRampToValueAtTime(42, t + 0.04);
+    gg.setValueAtTime(VD, t); gg.linearRampToValueAtTime(VD * 0.5, t + 0.04);
+    t += 0.042;
+  } else if (s % 8 === 4) {                   // the snare: as near to noise as one voice comes
+    for (let i = 0; i < 16; i++) f.setValueAtTime(700 + Math.random() * 3200, t + i * 0.0025);
+    gg.setValueAtTime(VD * 0.8, t); gg.linearRampToValueAtTime(VD * 0.3, t + 0.04);
+    t += 0.04;
+  }
+  if (m === '.') {
+    const n = Math.max(1, Math.floor((ts + st - t) / 0.026));
+    for (let i = 0; i < n; i++) f.setValueAtTime(NOTE(ch[(s * 2 + i) % 3]), t + i * 0.026);
+    gg.setValueAtTime(VA, t);
+    T.cur = 0;
+  } else if (m === '-') {
+    if (T.cur) { f.setValueAtTime(T.cur, t); gg.setValueAtTime(VM * 0.82, t); }
+  } else {
+    T.cur = NOTE(m);
+    f.setValueAtTime(T.cur, t);
+    gg.setValueAtTime(VM, t); gg.linearRampToValueAtTime(VM * 0.78, ts + st - 0.004);
+  }
+}
+function cncTuneStop(T, fade = 0.08) {
+  if (!T || T.done) return;
+  T.done = true; ANIM.delete(T.anim);
+  const t = AU.t();
+  try {
+    T.g.gain.cancelScheduledValues(t); T.o.frequency.cancelScheduledValues(t);
+    T.g.gain.setValueAtTime(T.g.gain.value, t); T.g.gain.linearRampToValueAtTime(0, t + fade); T.o.stop(t + fade + 0.03);
+  } catch (e) {}
+}
+
+// ---------------------------------------------------------------- the viewer
+const CNCV = { PB: new Buf(), NB: new Buf(), stars: starsNew(170, 9) };
+const CNC_SCROLL = '      cNc  .  THE LATTER-DAY PRIORS PRESENT  SOUL.ZIP  .  TEN FILES AND THE SOUL  .  GREETS TO AUGUSTINE  CALVIN  BAYES  MOLINA  AND THE REMNANT  .  NO GREETS TO PELAGIUS  .  YOUR PRIOR WAS SET BEFORE YOU WERE BORN  .  RUN HARROW.EXE  .  IT WAS GOING TO RUN ANYWAY  .  ';
+let CNC_COLS = null;
+function cncCols() {
+  if (CNC_COLS) return CNC_COLS;
+  const cols = [];
+  for (const ch of CNC_SCROLL.toUpperCase()) {
+    const g = BIGF[ch] || BIGF[' '];
+    for (let i = 0; i < g[0].length; i++) { let bits = 0; for (let r = 0; r < 6; r++) if (g[r][i] === '#') bits |= 1 << r; cols.push(bits); }
+    cols.push(0);
+  }
+  return (CNC_COLS = cols);
+}
+const CNC_RAIN = [LRD, YEL, LGN, LCY, LBL, LMG, WHT];
+// the scroller: big letters on a sine, in every colour, with a shadow under them
+function cncScroller(t, ybase, amp) {
+  const cols = cncCols(), off = Math.floor(t / 1000 * 52);
+  for (let pass = 0; pass < 2; pass++) for (let x = 0; x < W; x++) {
+    const ci = (x + off) >> 1, bits = cols[ci % cols.length];
+    if (!bits) continue;
+    const yb = Math.round(ybase + Math.sin((x + t / 22) / 15) * amp), c = CNC_RAIN[Math.floor((ci + t / 90) / 5) % CNC_RAIN.length];
+    for (let r = 0; r < 6; r++) if (bits & (1 << r)) { if (pass === 0) pset(x + 1, yb + r + 1, K0); else pset(x, yb + r, c); }
+  }
+}
+// the tunnel's lining: a checkerboard going down it, turning, the empty set on every fourth ring
+function cncTunnelTex(u, v, t) {
+  const a = u * 8 + t / 2400, d = v + t / 260;
+  const ring = Math.floor(d) % 6 === 0 && fract(d) < 0.45, ck = (Math.floor(a) + Math.floor(d)) & 1;
+  if (ring) return fract(a * 2) < 0.5 ? [255, 85, 85] : [170, 0, 0];
+  return ck ? [130, 0, 140] : [16, 0, 26];
+}
+// pieces drawn once off the screen before they are needed, so nothing stalls on the first frame of one
+function cncWarm(i) {
+  const P = CNC_PIECES[i];
+  if (!P || P.warm) return;
+  P.warm = true;
+  onto(CNCV.NB, () => P.draw(1));
+}
+const CNC_TRANS = ['flash', 'type', 'wipe', 'scroll', 'dissolve', 'type', 'curtain', 'flash', 'wipe', 'scroll'];
+
+function cncDraw(V) {
+  const t = NOW - V.t0;
+  // the flash: the whole palette run up to white and let down again
+  if (V.flash != null) {
+    const k = (NOW - V.flash) / (V.flashMs || 240);
+    if (k >= 0 && k < 1) { palScale(k * k, [255, 255, 255]); V.pal = true; }
+    else if (V.pal && k >= 1) { palReset(); V.pal = false; }
+  }
+  if (V.phase === 'presents') {
+    cls(LGR, K0);
+    const s = 'c N c     p r e s e n t s', x = Math.floor((W - s.length) / 2);
+    for (let i = 0; i < Math.min(V.typed || 0, s.length); i++) { const age = (V.typed - i); put(x + i, 12, s[i], age > 6 ? WHT : age > 3 ? LGR : DGR, K0); }
+    if ((V.typed || 0) < s.length && Math.floor(NOW / 120) % 2) put(x + (V.typed || 0), 12, '_', LGR, K0);
+    cncWarm(V.warm = ((V.warm || 0) + 1) % CNC_PIECES.length);
+    return;
+  }
+  if (V.phase === 'tunnel') {
+    const tcx = 320 + Math.sin(t / 900) * 70, tcy = 196 + Math.sin(t / 1300) * 26;
+    aTunnel(t, cncTunnelTex, { cx: tcx, cy: tcy, depth: 320, fog: 120 });
+    const L = aLogoBuild('cNc', { tw: 30, th: 24, gap: 1, round: 6 }), beat = fract(t / CNC_BEAT), pulse = Math.exp(-beat * 5);
+    const enter = ease(Math.min(1, t / 700));
+    aLogo(L, { x: 320 - L.w / 2, y: 4 - (1 - enter) * 300 + Math.sin(t / 380) * 5, scale: 0.74 + pulse * 0.05, bold: 3, mat: MAT.chrome({ bw: 10 }),
+      outline: AP[K0], ow: 8, extrude: { dx: 3, dy: 4, n: 4, col: (f) => AP[f < 0.4 ? LBL : BLU] } });
+    aQuant();
+    fill(0, 19, W, 6, ' ', LGR, K0);
+    cncScroller(t, 40, 2.6);
+    put(0, 18, '▄'.repeat(W), BLU, aCellNear(0, 18));
+    cncWarm(V.warm = ((V.warm || 0) + 1) % CNC_PIECES.length);
+    return;
+  }
+  if (V.phase === 'title') {
+    aPlasma(t, [[0, [10, 0, 40]], [0.25, [60, 0, 90]], [0.5, [0, 0, 60]], [0.75, [0, 40, 90]], [1, [10, 0, 40]]], { speed: 1.4 });
+    const L = aLogoBuild('SOUL.ZIP', { tw: 15, th: 19, gap: 1, round: 5 }), k = Math.min(1, t / 520);
+    const sc = k < 1 ? 0.15 + 0.95 * (1 - Math.pow(1 - k, 3)) + Math.sin(k * 9) * 0.03 * (1 - k) : 1 + 0.04 * Math.exp(-(t - 520) / 120) * Math.sin((t - 520) / 30);
+    aLogo(L, { x: 320 - L.w / 2, y: 130, scale: sc, bold: 3, mat: MAT.chrome({ bw: 8 }), outline: AP[K0], ow: 6, extrude: { dx: 2, dy: 3, n: 4, col: () => AP[BLU] } });
+    aQuant();
+    if (t > 560) { aCenter(21, ' ten files and the soul ', YEL, { bg: K0 }); aCenter(22, ' by the Latter-Day Priors ', DGR, { bg: K0 }); }
+    return;
+  }
+  if (V.phase === 'show') return cncShowDraw(V);
+  if (V.phase === 'door') return cncDoorDraw(V);
+  cls(LGR, K0);
+}
+
+function cncShowDraw(V) {
+  const P = CNC_PIECES[V.i], tp = NOW - V.pt0, Tt = V.ghost ? 300 : 450, k = Math.min(1, tp / Tt);
+  const NB = CNCV.NB, PB = CNCV.PB;
+  onto(NB, () => P.draw(tp + 120));
+  const tr = V.trans;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    let src = NB, edge = 0;
+    if (k < 1) {
+      if (tr === 'type') src = i < k * N ? NB : null;
+      else if (tr === 'wipe') { const f = (x + y * 2.4) - k * (W + 62); src = f < 0 ? NB : PB; if (f >= 0 && f < 3) edge = 3 - Math.floor(f); }
+      else if (tr === 'dissolve') src = ahash(x, y * 7) < k * 1.05 ? NB : PB;
+      else if (tr === 'curtain') src = Math.abs(x - 39.5) < k * 41 ? NB : PB;
+      else if (tr === 'scroll') {
+        const off = Math.floor(ease(k) * H);
+        if (y < H - off) { const j = (y + off) * W + x; S.ch[i] = PB.ch[j]; S.fg[i] = PB.fg[j]; S.bg[i] = PB.bg[j]; S.bl[i] = 0; continue; }
+        const j = (y - (H - off)) * W + x; S.ch[i] = NB.ch[j]; S.fg[i] = NB.fg[j]; S.bg[i] = NB.bg[j]; S.bl[i] = 0; continue;
+      }
+    }
+    if (edge) { S.ch[i] = cp(edge === 3 ? '█' : edge === 2 ? '▓' : '░'); S.fg[i] = edge === 3 ? WHT : LCY; S.bg[i] = K0; S.bl[i] = 0; continue; }
+    if (!src) { S.ch[i] = 32; S.fg[i] = LGR; S.bg[i] = K0; S.bl[i] = 0; continue; }
+    S.ch[i] = src.ch[i]; S.fg[i] = src.fg[i]; S.bg[i] = src.bg[i]; S.bl[i] = 0;
+  }
+  if (tr === 'type' && k < 1) { const c = Math.floor(k * N); if (c < N) { S.ch[c] = cp('▄'); S.fg[c] = LGR; S.bg[c] = K0; } }
+  // the viewer's own line, for a moment, when it is somebody's hand turning the pages
+  if (!V.ghost && tp < 1600) {
+    const s = ' SOUL.ZIP │ ' + String(V.i + 1).padStart(2, '0') + '/' + CNC_PIECES.length + ' │ ' + padR(P.file, 12) + ' │ ' + padR(P.by, 11) + ' │ ← → pages · Esc the door ';
+    put(0, 24, padR(s, W), WHT, BLU);
+  }
+}
+
+// ---------------------------------------------------------------- the door at the back
+const CNC_DOCTRINE = ['the soul is a file.', 'salvation is a copy operation.', '', 'your prior was set', 'before you were born.', '',
+  'the evidence will not', 'update it.', '', 'we call this grace.'];
+function cncDoorDraw(V) {
+  const t = NOW - V.t0, open = V.bar < 0 ? 0 : Math.min(1, V.bar / 100), lk = 0.6 + 0.4 * open + 0.03 * Math.sin(t / 90);
+  aFill([5, 3, 2]);
+  // the wall of the dark room, in courses, barely there
+  aRegion(0, 0, 640, 330, (px, py, k) => { const row = Math.floor(py / 26); if (fract((px + (row & 1) * 22) / 44) < 0.05 || fract(py / 26) < 0.08) aMix(k, [22, 13, 9], 1); });
+  // the floor, and the light thrown across it from the doorway, widening toward us
+  aRect(0, 330, 640, 400, [12, 7, 4]);
+  aPoly([128, 330, 262, 330, 470, 400, 40, 400], [255 * lk, 190 * lk, 70 * lk], 0.75);
+  aRegion(0, 330, 640, 400, (px, py, k) => aMul(k, 1 - (py - 330) / 110));
+  // the doorway: white at its heart, going to gold at the jambs
+  aRegion(128, 52, 262, 330, (px, py, k) => {
+    const d = Math.abs(px - 195) / 67, c = ramp([[0, [255, 255, 255]], [0.45, [255, 248, 170]], [0.8, [240, 180, 50]], [1, [180, 90, 0]]], d);
+    aMix(k, [c[0] * lk, c[1] * lk, c[2] * lk], 1);
+  });
+  // dust in the light
+  for (let i = 0; i < 14; i++) { const px = 140 + ((i * 53 + t / 40) % 110), py = 70 + ((i * 97 + t / 26) % 250); aAdd(((py >> 3) * AFW + (px >> 2)) * 3, [80, 70, 40], 1); }
+  aGlow(195, 190, 220, [255, 170, 40], 0.14 * lk, 230);
+  // the door, swung open toward us on its left hinge: its face in shadow, its edge lit
+  aPoly([128, 52, 70, 28, 70, 360, 128, 330], [120, 52, 8]);
+  aPoly([118, 76, 82, 62, 82, 178, 118, 182], [70, 26, 2]); aPoly([118, 204, 82, 204, 82, 334, 118, 318], [70, 26, 2]);
+  aPoly([70, 28, 78, 31, 78, 357, 70, 360], [255, 170, 40]);
+  aDisc(90, 196, 5, [255, 220, 90], 1, 5);
+  // the frame
+  aRect(120, 44, 270, 52, [110, 56, 14]); aRect(120, 44, 128, 332, [90, 44, 10]); aRect(262, 44, 270, 332, [70, 30, 6]);
+  aQuant({ pal: [K0, RED, BRN, LRD, YEL, WHT, DGR] });
+  const tx = 38;
+  put(tx, 2, 'C U L T   O F   T H E   N U L L   C O W', LCY, K0);
+  put(tx, 3, '- the Latter-Day Priors -', DGR, K0);
+  for (let i = 0; i < V.shown; i++) put(tx, 6 + i, CNC_DOCTRINE[i], i >= 6 ? YEL : LGR, K0);
+  if (V.bar >= 0 && V.bar <= 100) { const n = Math.round(V.bar / 5); put(tx, 18, 'opening  [' + '#'.repeat(n) + '·'.repeat(20 - n) + ']', LCY, K0); }
+  else if (V.bar > 100) put(tx, 18, 'the door was already open.', WHT, K0);
+  put(0, 24, padC('cNc  ·  SOUL.ZIP  ·  HARROW', W), K0, LGR);
+}
+
+// ---------------------------------------------------------------- the run
+HARROW.run = async function (o = {}) {
+  const prev = BASE, ghost = /^ghost/.test(o.src || '');
+  if (typeof PROV !== 'undefined') PROV.hide();                 // the pack takes the whole screen; the resident helper steps back
+  const V = { phase: 'presents', t0: NOW, ghost, typed: 0, i: 0, nav: 0, skip: false, end: false, shown: 0, bar: -1, warm: 0, tune: null, pal: false };
+  window.__harrow = V;
+  BASE = { name: 'harrow', draw: () => cncDraw(V) };
+  const h = {
+    modal: true,
+    key(ev) {
+      if (ev.k === 'Esc') { if (V.phase === 'show' || V.phase === 'door') V.end = true; else V.skip = true; return true; }
+      if (V.phase === 'show') {
+        if (ev.k === 'Right' || ev.k === 'PgDn' || ev.k === ' ' || ev.k === 'Enter' || ev.k === 'Down') V.nav = 1;
+        else if (ev.k === 'Left' || ev.k === 'PgUp' || ev.k === 'Backspace' || ev.k === 'Up') V.nav = -1;
+      } else if (V.phase === 'door') { if (V.bar > 100) V.end = true; }
+      else V.skip = true;
+      return true;
+    },
+    mouse(ev) { if (ev.type === 'down') { if (V.phase === 'show') V.nav = 1; else if (V.phase === 'door') { if (V.bar > 100) V.end = true; } else V.skip = true; } return true; },
+  };
+  pushH(h);
+  const until = async (ms, f) => { const t0 = NOW; while (NOW - t0 < ms && !(f && f())) await wait(30); };
+  // in the demonstration the whole of it keeps to the night's pace, within reason; the files go by on the beat
+  const pk = ghost ? Math.max(0.7, Math.min(1, G.pace())) : 1, short = ghost && G.pace() < 0.76;
+  try {
+    // the loader: who presents, then the tunnel and the scroller, then the name of the pack coming at you
+    AU.degauss();
+    const word = 'c N c     p r e s e n t s';
+    for (let i = 0; i < word.length && !V.skip; i++) { V.typed = i + 1; if (word[i] !== ' ') AU.beep(1200 + i * 30, 0.018, 0.3); await wait(ghost ? 14 : 42); }
+    await until(ghost ? 200 * pk : 650, () => V.skip);
+    V.tune = cncTune();
+    V.phase = 'tunnel'; V.t0 = NOW; V.flash = NOW; V.flashMs = 260;
+    await until(ghost ? 2500 * pk : 9500, () => V.skip);
+    V.skip = false;
+    V.phase = 'title'; V.t0 = NOW; V.flash = NOW + 500; V.flashMs = 300;
+    await until(ghost ? 900 * pk : 1400, () => V.skip);
+    V.skip = false;
+    // the pack: on the beat, three beats a file when nobody is turning the pages
+    for (let i = 0; i < CNC_PIECES.length; i++) cncWarm(i);
+    CNCV.PB.copyFrom(S);
+    V.phase = 'show'; V.i = 0; V.pt0 = NOW; V.trans = CNC_TRANS[0]; V.flash = NOW; V.flashMs = 220;
+    for (;;) {
+      const P = CNC_PIECES[V.i], beats = short ? (P.beatsShort || 2) : (P.beats || 3);
+      await until(ghost ? CNC_BEAT * beats : 7000, () => V.nav || V.end);
+      if (V.end) break;
+      const next = V.i + (V.nav || 1);
+      V.nav = 0;
+      if (next >= CNC_PIECES.length) break;
+      if (next < 0) continue;
+      CNCV.PB.copyFrom(S);
+      V.i = next; V.pt0 = NOW; V.trans = CNC_TRANS[next % CNC_TRANS.length];
+      if (V.trans === 'flash') { V.flash = NOW; V.flashMs = 200; }
+      if (V.trans === 'type') AU.hdd(2, 0.05);
+    }
+    // the door
+    cncTuneStop(V.tune, 0.6); V.tune = null;
+    if (V.pal) { palReset(); V.pal = false; }
+    V.flash = null; V.end = false;
+    V.phase = 'door'; V.t0 = NOW;
+    AU.drone(ghost ? 6 : 12, 0.5, 48);
+    for (let i = 0; i < CNC_DOCTRINE.length && !V.end; i++) {
+      V.shown = i + 1;
+      if (CNC_DOCTRINE[i]) AU.key('k', 0.3);
+      await until(CNC_DOCTRINE[i] ? (ghost ? 140 * pk : 620) : (ghost ? 50 : 240), () => V.end);
+    }
+    V.shown = CNC_DOCTRINE.length;
+    for (V.bar = 0; V.bar <= 100 && !V.end; V.bar += 5) { if (rnd() < 0.4) AU.hdd(1, 0.05); await wait(ghost ? 18 : 80); }
+    V.bar = 101; AU.beep(880, 0.12, 0.5);
+    await until(o.hold || (ghost ? 850 * pk : 6000), () => V.end);
+  } finally {
+    cncTuneStop(V.tune);
+    palReset();
+    popH(h); BASE = prev;
+  }
+};
+
 // ---- 99_main.js
 // The frame loop.
 
@@ -8342,7 +10304,7 @@ function boot() {
       defrag: () => DEFRAG.run({ src: 'you' }), surface: () => SURFACE.run({ src: 'you' }),
       whirl: () => WHIRL.run({ src: 'you' }), ride: () => RIDE.run({ src: 'you' }),
       rideauto: () => RIDE.run({ src: 'ghost', auto: true }),
-      zzt: () => ZZT.run({ src: 'you' }), crash: () => CRASH.run({ src: 'you' }), harrow: () => HARROW.run({ src: 'you' }),
+      zzt: () => ZZT.run({ src: 'you' }), crash: () => CRASH.run({ src: 'you' }), harrow: () => HARROW.run({ src: Q.get('src') || 'you' }),
       advent: () => ADVENT.run({ src: 'you' }), term: () => TERM.run({ src: 'you' }), msd: () => MSD.run({ src: 'you' }), msav: () => MSAV.run({ src: Q.get('src') || 'you' }), qbasic: () => QB.run({ src: Q.get('src') || 'you', file: 'TOANDFRO.BAS' }), termauto: () => TERM.run({ src: 'ghost', auto: true }),
       tithe: () => TITHE.run({ src: Q.get('src') || 'you' }),
       print: () => PRINTER.run({ docs: (Q.get('pf') || 'BANNER').toUpperCase().split(',').map(n => ({ dir: 'C:\\CHURCH', name: n + '.TXT', full: 'C:\\CHURCH\\' + n + '.TXT' })), src: Q.get('src') || 'you' }),
